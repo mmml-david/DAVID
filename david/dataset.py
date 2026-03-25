@@ -1,0 +1,164 @@
+"""Dataset for PerceptionTest videos from chancharikm/QualityCheck.
+
+Supports two modes:
+  - cached: Load pre-extracted .pt feature files (fast, recommended for training).
+  - online: Stream videos from HuggingFace, extract frames, run through backbone.
+"""
+
+import os
+import io
+import torch
+from torch import Tensor
+from torch.utils.data import Dataset
+from pathlib import Path
+
+
+def _load_cached_feature(path: str) -> dict:
+    """Load a cached feature file saved by extract_features.py."""
+    data = torch.load(path, map_location="cpu", weights_only=True)
+    features = data["features"].float()  # cast from float16 to float32
+    mask = data["mask"]
+    return {"features": features, "mask": mask}
+
+
+class PerceptionTestVideoDataset(Dataset):
+    """Dataset for pre-extracted Qwen3-VL features of PerceptionTest videos.
+
+    In cached mode: expects feature_cache_dir/{split}/*.pt files.
+    In online mode: streams videos from HuggingFace and extracts features on-the-fly.
+    """
+
+    def __init__(
+        self,
+        feature_cache_dir: str,
+        split: str = "train",
+        mode: str = "cached",
+        # Online mode args (ignored in cached mode)
+        hf_dataset_name: str = "chancharikm/QualityCheck",
+        subset: str = "PerceptionTest",
+        backbone=None,
+        max_frames: int = 8,
+    ):
+        self.mode = mode
+        self.split = split
+
+        if mode == "cached":
+            cache_path = Path(feature_cache_dir) / split
+            if not cache_path.exists():
+                raise FileNotFoundError(
+                    f"Feature cache not found at {cache_path}. "
+                    "Run extract_features.py first."
+                )
+            self.feature_files = sorted(cache_path.glob("*.pt"))
+            if len(self.feature_files) == 0:
+                raise ValueError(f"No .pt files found in {cache_path}")
+            print(f"[Dataset] Cached mode: {len(self.feature_files)} samples from {cache_path}")
+
+        elif mode == "online":
+            from datasets import load_dataset
+            assert backbone is not None, "backbone required for online mode"
+            self.backbone = backbone
+            self.max_frames = max_frames
+            self.processor = backbone.get_processor()
+
+            print(f"[Dataset] Online mode: streaming {hf_dataset_name} / {subset}")
+            ds = load_dataset(hf_dataset_name, name=subset, split=split, streaming=False)
+            self.dataset = ds
+        else:
+            raise ValueError(f"mode must be 'cached' or 'online', got {mode!r}")
+
+    def __len__(self) -> int:
+        if self.mode == "cached":
+            return len(self.feature_files)
+        return len(self.dataset)
+
+    def __getitem__(self, idx: int) -> dict:
+        if self.mode == "cached":
+            return _load_cached_feature(str(self.feature_files[idx]))
+        else:
+            return self._online_getitem(idx)
+
+    def _online_getitem(self, idx: int) -> dict:
+        """Extract features on-the-fly for a single video."""
+        import decord
+        from qwen_vl_utils import process_vision_info
+
+        sample = self.dataset[idx]
+
+        # Try common video field names
+        video_bytes = None
+        for field in ["video", "video_bytes", "mp4"]:
+            if field in sample and sample[field] is not None:
+                video_bytes = sample[field]
+                break
+
+        if video_bytes is None:
+            raise ValueError(f"No video field found in sample {idx}. Keys: {list(sample.keys())}")
+
+        # Decode video frames using decord
+        if isinstance(video_bytes, bytes):
+            video_bytes = io.BytesIO(video_bytes)
+
+        vr = decord.VideoReader(video_bytes, ctx=decord.cpu(0))
+        total_frames = len(vr)
+        indices = _sample_frame_indices(total_frames, self.max_frames)
+        frames = vr.get_batch(indices).asnumpy()  # [T, H, W, C]
+
+        # Build message format for Qwen3-VL processor
+        # Save frames temporarily as numpy arrays for process_vision_info
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "video",
+                        "video": frames,  # numpy array [T, H, W, C]
+                        "fps": 1.0,
+                    },
+                    {"type": "text", "text": "Describe the video."},
+                ],
+            }
+        ]
+
+        text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        image_inputs, video_inputs, video_kwargs = process_vision_info(messages, return_video_kwargs=True)
+
+        inputs = self.processor(
+            text=[text],
+            videos=video_inputs,
+            **video_kwargs,
+            return_tensors="pt",
+        )
+
+        pixel_values = inputs["pixel_values_videos"]  # [total_patches, C*t*h*w]
+        grid_thw = inputs["video_grid_thw"]           # [1, 3]
+
+        features, mask = self.backbone.extract_features(pixel_values, grid_thw)
+        # features: [1, N, D], mask: [1, N] — squeeze batch dim
+        return {"features": features[0].cpu(), "mask": mask[0].cpu()}
+
+    @staticmethod
+    def collate_fn(batch: list[dict]) -> dict:
+        """Pad variable-length features to a uniform batch tensor.
+
+        Args:
+            batch: List of dicts with "features" [N_i, D] and "mask" [N_i].
+
+        Returns:
+            Dict with:
+                features: [B, N_max, D]
+                mask:     [B, N_max] bool
+        """
+        from .utils import pad_sequence_to_max
+
+        feature_list = [item["features"] for item in batch]
+        features, mask = pad_sequence_to_max(feature_list)
+        return {"features": features, "mask": mask}
+
+
+def _sample_frame_indices(total_frames: int, n_frames: int) -> list[int]:
+    """Uniformly sample n_frames indices from [0, total_frames)."""
+    if total_frames <= n_frames:
+        return list(range(total_frames))
+    step = total_frames / n_frames
+    return [int(i * step) for i in range(n_frames)]

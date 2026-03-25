@@ -1,0 +1,37 @@
+model:
+  backbone_name: "Qwen/Qwen3-VL-2B-Instruct"
+  backbone_dtype: "bfloat16"
+  input_dim: 2048         # Qwen3-VL-2B pooler_output dim
+  latent_dim: 2048
+  L: 64                   # number of DAVID latent tokens
+  N_queries: 256          # fixed decoder output tokens
+  n_encoder_layers: 4
+  n_decoder_layers: 4
+  n_heads: 16
+  dropout: 0.1
+
+training:
+  batch_size: 8
+  gradient_accumulation_steps: 4
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  max_steps: 100000
+  warmup_steps: 1000
+  beta_target: 1.0e-4
+  beta_warmup_steps: 10000
+  grad_clip: 1.0
+
+data:
+  dataset_name: "chancharikm/QualityCheck"
+  subset: "PerceptionTest"
+  feature_cache_dir: "./features_cache"
+  max_frames: 8
+  num_workers: 4
+
+logging:
+  use_wandb: true
+  project: "DAVID"
+  log_every: 50
+  eval_every: 1000
+  save_every: 5000
+  checkpoint_dir: "./checkpoints"
