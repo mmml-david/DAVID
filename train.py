@@ -82,12 +82,16 @@ def parse_args():
     parser.add_argument("--smoke_test", action="store_true", help="Quick sanity check (2 steps)")
     parser.add_argument("--resume", action="store_true", help="Resume from latest checkpoint")
     parser.add_argument("--device", default=None, help="Override device (e.g. cpu, cuda, mps)")
+    parser.add_argument("--debug_log", action="store_true", help="Print concise progress logs")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
     cfg = load_config(args.config)
+    def dbg(msg: str):
+        if args.debug_log:
+            print(f"[Debug] {msg}", flush=True)
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
@@ -140,6 +144,7 @@ def main():
             split="train",
             mode="cached",
         )
+    dbg(f"Dataset ready: mode={'online' if args.online else 'cached'}, size={len(dataset)}")
 
     loader = DataLoader(
         dataset,
@@ -150,6 +155,7 @@ def main():
         pin_memory=(device == "cuda"),
         drop_last=True,
     )
+    dbg(f"DataLoader ready: batch_size={cfg.training.batch_size}, num_workers={0 if args.smoke_test else cfg.data.num_workers}")
 
     # ── WandB ──
     use_wandb = cfg.logging.use_wandb and not args.smoke_test
@@ -172,17 +178,36 @@ def main():
     vae.train()
 
     print(f"Starting training from step {start_step}")
+    dbg("Entering training loop")
 
     with tqdm(total=max_steps, initial=start_step, desc="Training") as pbar:
         while step < max_steps:
-            for batch in loader:
+            dbg("Starting new dataloader pass")
+            loader_iter = iter(loader)
+            while step < max_steps:
                 if step >= max_steps:
                     break
 
+                dbg(f"Fetching batch for step {step}")
+                try:
+                    batch = next(loader_iter)
+                except StopIteration:
+                    dbg("Reached end of dataloader pass")
+                    break
+                dbg("Batch fetched")
+
                 features = batch["features"].to(device)  # [B, N, D]
                 mask = batch["mask"].to(device)          # [B, N]
+                feature_dim = features.shape[-1]
+                if feature_dim != david_cfg.input_dim:
+                    raise ValueError(
+                        f"Feature dim mismatch: batch has D={feature_dim}, "
+                        f"but model.input_dim={david_cfg.input_dim}. "
+                        "This usually means cached features were extracted with a different backbone."
+                    )
 
                 # Forward through VAE
+                dbg("Running model forward")
                 output = vae(features, mask, training=True)
 
                 # Build reconstruction target by interpolating features to N_queries
@@ -190,6 +215,7 @@ def main():
                 target = target.detach()
 
                 # Compute loss
+                dbg("Computing loss")
                 beta = beta_sched.get_beta(step)
                 loss_out = david_loss(
                     recon=output.recon,
@@ -201,10 +227,12 @@ def main():
                 )
 
                 # Backward (scaled for gradient accumulation)
+                dbg("Running backward")
                 scaled_loss = loss_out.total / grad_accum
                 scaled_loss.backward()
 
                 if (step + 1) % grad_accum == 0:
+                    dbg("Running optimizer step")
                     torch.nn.utils.clip_grad_norm_(vae.parameters(), cfg.training.grad_clip)
                     optimizer.step()
                     scheduler.step()
