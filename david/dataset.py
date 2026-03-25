@@ -55,14 +55,21 @@ class PerceptionTestVideoDataset(Dataset):
             print(f"[Dataset] Cached mode: {len(self.feature_files)} samples from {cache_path}")
 
         elif mode == "online":
-            from datasets import load_dataset
+            from datasets import Video, load_dataset
             assert backbone is not None, "backbone required for online mode"
             self.backbone = backbone
             self.max_frames = max_frames
             self.processor = backbone.get_processor()
 
             print(f"[Dataset] Online mode: streaming {hf_dataset_name} / {subset}")
-            ds = load_dataset(hf_dataset_name, name=subset, split=split, streaming=False)
+            ds = load_dataset(
+                hf_dataset_name,
+                data_dir=subset,
+                split=split,
+                streaming=False,
+            )
+            if "video" in ds.column_names:
+                ds = ds.cast_column("video", Video(decode=False))
             self.dataset = ds
         else:
             raise ValueError(f"mode must be 'cached' or 'online', got {mode!r}")
@@ -81,38 +88,51 @@ class PerceptionTestVideoDataset(Dataset):
     def _online_getitem(self, idx: int) -> dict:
         """Extract features on-the-fly for a single video."""
         import decord
+        from PIL import Image
         from qwen_vl_utils import process_vision_info
 
         sample = self.dataset[idx]
 
         # Try common video field names
-        video_bytes = None
+        video_source = None
         for field in ["video", "video_bytes", "mp4"]:
             if field in sample and sample[field] is not None:
-                video_bytes = sample[field]
+                video_source = sample[field]
                 break
 
-        if video_bytes is None:
+        if video_source is None:
             raise ValueError(f"No video field found in sample {idx}. Keys: {list(sample.keys())}")
 
         # Decode video frames using decord
-        if isinstance(video_bytes, bytes):
-            video_bytes = io.BytesIO(video_bytes)
+        if isinstance(video_source, dict):
+            if video_source.get("path") is not None:
+                vr = decord.VideoReader(video_source["path"], ctx=decord.cpu(0))
+            elif video_source.get("bytes") is not None:
+                vr = decord.VideoReader(io.BytesIO(video_source["bytes"]), ctx=decord.cpu(0))
+            else:
+                raise ValueError(
+                    f"Video dict in sample {idx} has neither 'path' nor 'bytes': {video_source.keys()}"
+                )
+        elif isinstance(video_source, bytes):
+            vr = decord.VideoReader(io.BytesIO(video_source), ctx=decord.cpu(0))
+        else:
+            vr = decord.VideoReader(video_source, ctx=decord.cpu(0))
 
-        vr = decord.VideoReader(video_bytes, ctx=decord.cpu(0))
         total_frames = len(vr)
         indices = _sample_frame_indices(total_frames, self.max_frames)
         frames = vr.get_batch(indices).asnumpy()  # [T, H, W, C]
 
         # Build message format for Qwen3-VL processor
         # Save frames temporarily as numpy arrays for process_vision_info
+        # qwen_vl_utils expects each frame to be path/url/PIL.Image in list/tuple form.
+        frame_list = [Image.fromarray(frame) for frame in frames]
         messages = [
             {
                 "role": "user",
                 "content": [
                     {
                         "type": "video",
-                        "video": frames,  # numpy array [T, H, W, C]
+                        "video": frame_list,  # list of numpy arrays [H, W, C]
                         "fps": 1.0,
                     },
                     {"type": "text", "text": "Describe the video."},
@@ -122,6 +142,8 @@ class PerceptionTestVideoDataset(Dataset):
 
         text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         image_inputs, video_inputs, video_kwargs = process_vision_info(messages, return_video_kwargs=True)
+        if isinstance(video_kwargs.get("fps"), list) and len(video_kwargs["fps"]) == 1:
+            video_kwargs["fps"] = video_kwargs["fps"][0]
 
         inputs = self.processor(
             text=[text],

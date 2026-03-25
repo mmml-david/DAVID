@@ -1,0 +1,6 @@
+features_cache/
+checkpoints/
+wandb/
+.venv/
+.DS_Store
+__pycache__/

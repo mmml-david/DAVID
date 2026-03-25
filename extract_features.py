@@ -8,7 +8,7 @@ Usage:
         --cache_dir ./features_cache \
         --split train \
         --max_frames 8 \
-        --model_name Qwen/Qwen3-VL-2B-Instruct \
+        --model_name Qwen/Qwen3-VL-8B-Instruct \
         --device cuda \
         --max_samples -1   # -1 = all samples
 """
@@ -29,7 +29,7 @@ def parse_args():
     parser.add_argument("--subset", default="PerceptionTest")
     parser.add_argument("--dataset_name", default="chancharikm/QualityCheck")
     parser.add_argument("--max_frames", type=int, default=8)
-    parser.add_argument("--model_name", default="Qwen/Qwen3-VL-2B-Instruct")
+    parser.add_argument("--model_name", default="Qwen/Qwen3-VL-8B-Instruct")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--max_samples", type=int, default=-1, help="-1 = all")
     return parser.parse_args()
@@ -45,38 +45,48 @@ def sample_frame_indices(total_frames: int, n_frames: int) -> list[int]:
 def extract_one(sample, backbone, processor, max_frames: int):
     """Extract Qwen3-VL features from a single dataset sample."""
     import decord
+    from PIL import Image
     from qwen_vl_utils import process_vision_info
 
     # Try common video field names
-    video_bytes = None
+    video_source = None
     for field in ["video", "video_bytes", "mp4"]:
         if field in sample and sample[field] is not None:
-            video_bytes = sample[field]
+            video_source = sample[field]
             break
 
-    if video_bytes is None:
+    if video_source is None:
         return None, f"No video field. Keys: {list(sample.keys())}"
 
     try:
-        if isinstance(video_bytes, bytes):
-            video_io = io.BytesIO(video_bytes)
+        if isinstance(video_source, dict):
+            # datasets.Video(decode=False) returns {"path": ..., "bytes": ...}
+            if video_source.get("path") is not None:
+                vr = decord.VideoReader(video_source["path"], ctx=decord.cpu(0))
+            elif video_source.get("bytes") is not None:
+                vr = decord.VideoReader(io.BytesIO(video_source["bytes"]), ctx=decord.cpu(0))
+            else:
+                return None, "Video dict has neither 'path' nor 'bytes'"
+        elif isinstance(video_source, bytes):
+            vr = decord.VideoReader(io.BytesIO(video_source), ctx=decord.cpu(0))
         else:
-            video_io = video_bytes
+            vr = decord.VideoReader(video_source, ctx=decord.cpu(0))
 
-        vr = decord.VideoReader(video_io, ctx=decord.cpu(0))
         total_frames = len(vr)
         indices = sample_frame_indices(total_frames, max_frames)
         frames = vr.get_batch(indices).asnumpy()  # [T, H, W, C]
     except Exception as e:
         return None, f"Video decode error: {e}"
 
+    # qwen_vl_utils expects each frame to be path/url/PIL.Image in list/tuple form.
+    frame_list = [Image.fromarray(frame) for frame in frames]
     messages = [
         {
             "role": "user",
             "content": [
                 {
                     "type": "video",
-                    "video": frames,
+                    "video": frame_list,
                     "fps": 1.0,
                 },
                 {"type": "text", "text": "Describe the video."},
@@ -86,6 +96,8 @@ def extract_one(sample, backbone, processor, max_frames: int):
 
     text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     image_inputs, video_inputs, video_kwargs = process_vision_info(messages, return_video_kwargs=True)
+    if isinstance(video_kwargs.get("fps"), list) and len(video_kwargs["fps"]) == 1:
+        video_kwargs["fps"] = video_kwargs["fps"][0]
 
     inputs = processor(
         text=[text],
@@ -108,7 +120,7 @@ def extract_one(sample, backbone, processor, max_frames: int):
 def main():
     args = parse_args()
 
-    from datasets import load_dataset
+    from datasets import Video, load_dataset
     from david.backbone import Qwen3VLBackbone
 
     # Setup output directory
@@ -125,7 +137,13 @@ def main():
 
     # Load dataset
     print(f"Loading dataset {args.dataset_name} / {args.subset} split={args.split}")
-    ds = load_dataset(args.dataset_name, name=args.subset, split=args.split)
+    ds = load_dataset(
+        args.dataset_name,
+        data_dir=args.subset,
+        split=args.split,
+    )
+    if "video" in ds.column_names:
+        ds = ds.cast_column("video", Video(decode=False))
 
     n_total = len(ds) if args.max_samples == -1 else min(args.max_samples, len(ds))
     print(f"Processing {n_total} samples → {out_dir}")
