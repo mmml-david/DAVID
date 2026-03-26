@@ -28,6 +28,18 @@ data:
   max_frames: 8
   num_workers: 4
 
+extraction:
+  dataset_name: "chancharikm/QualityCheck"
+  subset: "PerceptionTest"
+  split: "train"
+  cache_dir: "./features_cache"
+  max_frames: 8
+  model_name: "Qwen/Qwen3-VL-8B-Instruct"
+  device: "cuda"
+  max_samples: -1        # -1 = all samples
+  num_shards: 1
+  shard_id: 0
+
 logging:
   use_wandb: true
   project: "DAVID"

@@ -7,20 +7,23 @@ Output filenames use the global dataset index: {global_idx:07d}.pt
 This ensures files from different machines never collide when writing to a
 shared directory.
 
-Single-machine usage:
-    python extract_features.py \
-        --cache_dir ./features_cache \
-        --split train \
-        --max_frames 8 \
-        --model_name Qwen/Qwen3-VL-8B-Instruct \
-        --device cuda
+Options are read from the extraction: section of the YAML config file, then
+overridden by any CLI flags that are explicitly provided.
 
-Distributed usage (run on each machine with a different --shard_id):
+Single-machine usage (all settings from config):
+    python extract_features.py --config configs/train_config.yaml
+
+Override specific settings via CLI (takes precedence over config):
+    python extract_features.py --config configs/train_config.yaml \
+        --device cuda:1 --max_samples 100
+
+Distributed usage — each machine sets its own --shard_id:
     # Machine 0 of 4:
-    python extract_features.py --num_shards 4 --shard_id 0 --cache_dir /shared/features_cache
+    python extract_features.py --config configs/train_config.yaml \
+        --num_shards 4 --shard_id 0 --cache_dir /shared/features_cache
     # Machine 1 of 4:
-    python extract_features.py --num_shards 4 --shard_id 1 --cache_dir /shared/features_cache
-    # ...and so on.
+    python extract_features.py --config configs/train_config.yaml \
+        --num_shards 4 --shard_id 1 --cache_dir /shared/features_cache
 
 Each machine writes non-overlapping files named by their global index.
 Re-running is safe — existing files are skipped (resume support).
@@ -30,29 +33,72 @@ import argparse
 import io
 import os
 from pathlib import Path
+from typing import Any
 
 import torch
+import yaml
 from tqdm import tqdm
 
 
 def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--cache_dir", default="./features_cache")
-    parser.add_argument("--split", default="train")
-    parser.add_argument("--subset", default="PerceptionTest")
-    parser.add_argument("--dataset_name", default="chancharikm/QualityCheck")
-    parser.add_argument("--max_frames", type=int, default=8)
-    parser.add_argument("--model_name", default="Qwen/Qwen3-VL-8B-Instruct")
-    parser.add_argument("--device", default="cuda")
-    parser.add_argument("--max_samples", type=int, default=-1, help="-1 = all")
-    # Distributed extraction: split the dataset into num_shards contiguous ranges.
-    # Each machine runs with a unique shard_id in [0, num_shards).
-    # Output files are named by global index so all machines share one directory safely.
-    parser.add_argument("--num_shards", type=int, default=1,
+    parser = argparse.ArgumentParser(
+        description="Extract Qwen3-VL features from PerceptionTest videos.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    # Config file — all other flags are optional overrides
+    parser.add_argument("--config", default="configs/train_config.yaml",
+                        help="Path to YAML config file (uses extraction: section)")
+
+    # All flags default to None so we can tell when the user explicitly set them.
+    # Values from the config fill in anything left as None.
+    parser.add_argument("--cache_dir", default=None)
+    parser.add_argument("--split", default=None)
+    parser.add_argument("--subset", default=None)
+    parser.add_argument("--dataset_name", default=None)
+    parser.add_argument("--max_frames", type=int, default=None)
+    parser.add_argument("--model_name", default=None)
+    parser.add_argument("--device", default=None)
+    parser.add_argument("--max_samples", type=int, default=None,
+                        help="Max samples to process (-1 = all)")
+    parser.add_argument("--num_shards", type=int, default=None,
                         help="Total number of machines processing in parallel")
-    parser.add_argument("--shard_id", type=int, default=0,
+    parser.add_argument("--shard_id", type=int, default=None,
                         help="Index of this machine (0-indexed, must be < num_shards)")
     return parser.parse_args()
+
+
+def load_extraction_config(config_path: str) -> dict[str, Any]:
+    """Load the extraction section from a YAML config file."""
+    with open(config_path) as f:
+        cfg = yaml.safe_load(f)
+    return cfg.get("extraction", {})
+
+
+def resolve_args(args, config_path: str) -> argparse.Namespace:
+    """Merge config file values with CLI args. CLI args take precedence."""
+    cfg = load_extraction_config(config_path)
+
+    # Fallback defaults (used if neither CLI nor config provides a value)
+    defaults = {
+        "cache_dir": "./features_cache",
+        "split": "train",
+        "subset": "PerceptionTest",
+        "dataset_name": "chancharikm/QualityCheck",
+        "max_frames": 8,
+        "model_name": "Qwen/Qwen3-VL-8B-Instruct",
+        "device": "cuda",
+        "max_samples": -1,
+        "num_shards": 1,
+        "shard_id": 0,
+    }
+
+    for key, default in defaults.items():
+        cli_val = getattr(args, key, None)
+        if cli_val is None:
+            # CLI not set — use config value, or built-in default
+            setattr(args, key, cfg.get(key, default))
+
+    return args
 
 
 def sample_frame_indices(total_frames: int, n_frames: int) -> list[int]:
@@ -139,6 +185,12 @@ def extract_one(sample, backbone, processor, max_frames: int):
 
 def main():
     args = parse_args()
+    args = resolve_args(args, args.config)
+    print(f"Config: {args.config}")
+    print(f"  dataset={args.dataset_name}/{args.subset}  split={args.split}")
+    print(f"  cache_dir={args.cache_dir}  model={args.model_name}  device={args.device}")
+    print(f"  max_frames={args.max_frames}  max_samples={args.max_samples}")
+    print(f"  shard={args.shard_id}/{args.num_shards}")
 
     from datasets import Video, load_dataset
     from david.backbone import Qwen3VLBackbone
