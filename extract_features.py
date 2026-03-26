@@ -3,14 +3,27 @@
 Downloads PerceptionTest videos from chancharikm/QualityCheck and extracts
 Qwen3-VL visual features, saving them as .pt files for fast VAE training.
 
-Usage:
+Output filenames use the global dataset index: {global_idx:07d}.pt
+This ensures files from different machines never collide when writing to a
+shared directory.
+
+Single-machine usage:
     python extract_features.py \
         --cache_dir ./features_cache \
         --split train \
         --max_frames 8 \
         --model_name Qwen/Qwen3-VL-8B-Instruct \
-        --device cuda \
-        --max_samples -1   # -1 = all samples
+        --device cuda
+
+Distributed usage (run on each machine with a different --shard_id):
+    # Machine 0 of 4:
+    python extract_features.py --num_shards 4 --shard_id 0 --cache_dir /shared/features_cache
+    # Machine 1 of 4:
+    python extract_features.py --num_shards 4 --shard_id 1 --cache_dir /shared/features_cache
+    # ...and so on.
+
+Each machine writes non-overlapping files named by their global index.
+Re-running is safe — existing files are skipped (resume support).
 """
 
 import argparse
@@ -32,6 +45,13 @@ def parse_args():
     parser.add_argument("--model_name", default="Qwen/Qwen3-VL-8B-Instruct")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--max_samples", type=int, default=-1, help="-1 = all")
+    # Distributed extraction: split the dataset into num_shards contiguous ranges.
+    # Each machine runs with a unique shard_id in [0, num_shards).
+    # Output files are named by global index so all machines share one directory safely.
+    parser.add_argument("--num_shards", type=int, default=1,
+                        help="Total number of machines processing in parallel")
+    parser.add_argument("--shard_id", type=int, default=0,
+                        help="Index of this machine (0-indexed, must be < num_shards)")
     return parser.parse_args()
 
 
@@ -145,30 +165,45 @@ def main():
     if "video" in ds.column_names:
         ds = ds.cast_column("video", Video(decode=False))
 
+    assert 0 <= args.shard_id < args.num_shards, \
+        f"shard_id={args.shard_id} must be in [0, num_shards={args.num_shards})"
+
     n_total = len(ds) if args.max_samples == -1 else min(args.max_samples, len(ds))
-    print(f"Processing {n_total} samples → {out_dir}")
+
+    # Compute the contiguous slice of global indices this machine owns.
+    # Indices are assigned as evenly as possible; the last shard absorbs any remainder.
+    shard_size = n_total // args.num_shards
+    start_idx = args.shard_id * shard_size
+    end_idx = n_total if args.shard_id == args.num_shards - 1 else start_idx + shard_size
+    my_indices = range(start_idx, end_idx)
+
+    print(
+        f"Shard {args.shard_id}/{args.num_shards}: "
+        f"global indices [{start_idx}, {end_idx}) — {len(my_indices)} samples → {out_dir}"
+    )
 
     n_saved = 0
     n_errors = 0
 
-    for i in tqdm(range(n_total), desc="Extracting features"):
-        out_path = out_dir / f"{i:06d}.pt"
+    for global_idx in tqdm(my_indices, desc=f"Shard {args.shard_id}"):
+        # Filename is the global dataset index — unique across all machines.
+        out_path = out_dir / f"{global_idx:07d}.pt"
         if out_path.exists():
             n_saved += 1
             continue  # resume support
 
-        sample = ds[i]
+        sample = ds[global_idx]
         result, err = extract_one(sample, backbone, processor, args.max_frames)
 
         if err is not None:
-            print(f"[WARN] Sample {i}: {err}")
+            print(f"[WARN] Sample {global_idx}: {err}")
             n_errors += 1
             continue
 
         torch.save(result, out_path)
         n_saved += 1
 
-    print(f"\nDone. Saved: {n_saved}, Errors: {n_errors}")
+    print(f"\nShard {args.shard_id} done. Saved: {n_saved}, Errors: {n_errors}")
 
 
 if __name__ == "__main__":
