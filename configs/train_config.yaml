@@ -25,7 +25,8 @@ data:
   dataset_name: "chancharikm/QualityCheck"
   subset: "PerceptionTest"
   feature_cache_dir: "./features_cache"
-  max_frames: 8
+  sample_fps: 1.0         # sample 1 frame per second; videos vary in length so token count varies per video
+  max_frames: 64          # safety cap to avoid OOM on unusually long videos
   num_workers: 4
 
 extraction:
@@ -33,12 +34,13 @@ extraction:
   subset: "PerceptionTest"
   split: "train"
   cache_dir: "./features_cache"
-  max_frames: 8
+  sample_fps: 1.0         # sample 1 frame per second
+  max_frames: 64          # safety cap
   model_name: "Qwen/Qwen3-VL-8B-Instruct"
   device: "cuda"
-  max_samples: -1        # -1 = all samples
+  max_samples: -1         # -1 = all samples
   num_shards: 1
-  shard_id: 0
+  # shard_id: 0  # must be set explicitly when num_shards > 1
 
 logging:
   use_wandb: true

@@ -3,9 +3,11 @@
 Downloads PerceptionTest videos from chancharikm/QualityCheck and extracts
 Qwen3-VL visual features, saving them as .pt files for fast VAE training.
 
-Output filenames use the global dataset index: {global_idx:07d}.pt
-This ensures files from different machines never collide when writing to a
-shared directory.
+Output filenames use the video name from the dataset: {video_name}.pt
+This naturally deduplicates (PerceptionTest has ~30k rows but only ~11.6k unique
+videos — multiple QA pairs per video) and makes the cache self-documenting.
+Files from different shards are still non-overlapping because each shard owns a
+disjoint slice of the unique-video list.
 
 Options are read from the extraction: section of the YAML config file, then
 overridden by any CLI flags that are explicitly provided.
@@ -55,7 +57,10 @@ def parse_args():
     parser.add_argument("--split", default=None)
     parser.add_argument("--subset", default=None)
     parser.add_argument("--dataset_name", default=None)
-    parser.add_argument("--max_frames", type=int, default=None)
+    parser.add_argument("--sample_fps", type=float, default=None,
+                        help="Frames per second to sample from each video")
+    parser.add_argument("--max_frames", type=int, default=None,
+                        help="Safety cap on frames per video (in case of very long videos)")
     parser.add_argument("--model_name", default=None)
     parser.add_argument("--device", default=None)
     parser.add_argument("--max_samples", type=int, default=None,
@@ -78,37 +83,59 @@ def resolve_args(args, config_path: str) -> argparse.Namespace:
     """Merge config file values with CLI args. CLI args take precedence."""
     cfg = load_extraction_config(config_path)
 
-    # Fallback defaults (used if neither CLI nor config provides a value)
+    # Fallback defaults (used if neither CLI nor config provides a value).
+    # shard_id intentionally omitted — it must be set explicitly when num_shards > 1.
     defaults = {
         "cache_dir": "./features_cache",
         "split": "train",
         "subset": "PerceptionTest",
         "dataset_name": "chancharikm/QualityCheck",
-        "max_frames": 8,
+        "sample_fps": 1.0,
+        "max_frames": 64,
         "model_name": "Qwen/Qwen3-VL-8B-Instruct",
         "device": "cuda",
         "max_samples": -1,
         "num_shards": 1,
-        "shard_id": 0,
     }
 
     for key, default in defaults.items():
-        cli_val = getattr(args, key, None)
-        if cli_val is None:
-            # CLI not set — use config value, or built-in default
+        if getattr(args, key, None) is None:
             setattr(args, key, cfg.get(key, default))
+
+    # Resolve shard_id separately: no built-in default when num_shards > 1.
+    if args.shard_id is None:
+        args.shard_id = cfg.get("shard_id", None)
+
+    if args.num_shards > 1 and args.shard_id is None:
+        raise ValueError(
+            f"--shard_id is required when --num_shards={args.num_shards} > 1. "
+            "Set it via CLI (--shard_id N) or under extraction.shard_id in the config."
+        )
+
+    # When num_shards == 1, default shard_id to 0.
+    if args.shard_id is None:
+        args.shard_id = 0
 
     return args
 
 
-def sample_frame_indices(total_frames: int, n_frames: int) -> list[int]:
-    if total_frames <= n_frames:
-        return list(range(total_frames))
-    step = total_frames / n_frames
-    return [int(i * step) for i in range(n_frames)]
+def sample_frame_indices_at_fps(
+    total_frames: int, video_fps: float, sample_fps: float, max_frames: int
+) -> list[int]:
+    """Return frame indices sampled at sample_fps, capped at max_frames.
+
+    Args:
+        total_frames: Total number of frames in the video.
+        video_fps:    Native fps of the video (from decord).
+        sample_fps:   Desired sampling rate (e.g. 1.0 for 1 fps).
+        max_frames:   Hard cap to avoid OOM on unusually long videos.
+    """
+    stride = video_fps / sample_fps          # e.g. 30fps / 1fps = take every 30th frame
+    n = min(int(total_frames / stride), max_frames)
+    return [int(i * stride) for i in range(n)]
 
 
-def extract_one(sample, backbone, processor, max_frames: int):
+def extract_one(sample, backbone, processor, sample_fps: float, max_frames: int):
     """Extract Qwen3-VL features from a single dataset sample."""
     import decord
     from PIL import Image
@@ -138,8 +165,9 @@ def extract_one(sample, backbone, processor, max_frames: int):
         else:
             vr = decord.VideoReader(video_source, ctx=decord.cpu(0))
 
+        video_fps = vr.get_avg_fps()
         total_frames = len(vr)
-        indices = sample_frame_indices(total_frames, max_frames)
+        indices = sample_frame_indices_at_fps(total_frames, video_fps, sample_fps, max_frames)
         frames = vr.get_batch(indices).asnumpy()  # [T, H, W, C]
     except Exception as e:
         return None, f"Video decode error: {e}"
@@ -153,7 +181,7 @@ def extract_one(sample, backbone, processor, max_frames: int):
                 {
                     "type": "video",
                     "video": frame_list,
-                    "fps": 1.0,
+                    "fps": sample_fps,
                 },
                 {"type": "text", "text": "Describe the video."},
             ],
@@ -176,11 +204,24 @@ def extract_one(sample, backbone, processor, max_frames: int):
     grid_thw = inputs["video_grid_thw"]
 
     features, mask = backbone.extract_features(pixel_values, grid_thw)
-    # features: [1, N, D], squeeze batch dim, save as float16
-    return {
-        "features": features[0].cpu().half(),
-        "mask": mask[0].cpu(),
-    }, None
+    # features: [1, N, D], squeeze batch dim, save as float16.
+    # Mask is not saved — each file is one complete video so all tokens are always valid.
+    return {"features": features[0].cpu().half()}, None
+
+
+def _find_video_name_col(column_names: list[str]) -> str:
+    """Return the column that identifies unique videos (e.g. 'video_name', 'video_id')."""
+    # Prefer exact matches first, then partial matches.
+    for candidate in ("video_name", "video_id", "videoname", "videoid"):
+        if candidate in column_names:
+            return candidate
+    for col in column_names:
+        if "video" in col.lower() and ("name" in col.lower() or "id" in col.lower()):
+            return col
+    raise ValueError(
+        f"Could not find a video identifier column in {column_names}. "
+        "Set the column name explicitly or check the dataset schema."
+    )
 
 
 def main():
@@ -189,7 +230,7 @@ def main():
     print(f"Config: {args.config}")
     print(f"  dataset={args.dataset_name}/{args.subset}  split={args.split}")
     print(f"  cache_dir={args.cache_dir}  model={args.model_name}  device={args.device}")
-    print(f"  max_frames={args.max_frames}  max_samples={args.max_samples}")
+    print(f"  sample_fps={args.sample_fps}  max_frames={args.max_frames}  max_samples={args.max_samples}")
     print(f"  shard={args.shard_id}/{args.num_shards}")
 
     from datasets import Video, load_dataset
@@ -217,38 +258,50 @@ def main():
     if "video" in ds.column_names:
         ds = ds.cast_column("video", Video(decode=False))
 
+    # Deduplicate: PerceptionTest has ~30k rows but only ~11.6k unique videos
+    # (multiple QA pairs per video). Build a mapping: video_name → first row index.
+    video_name_col = _find_video_name_col(ds.column_names)
+    print(f"Using '{video_name_col}' as the video identifier column.")
+    unique_videos: dict[str, int] = {}
+    for row_idx, name in enumerate(ds[video_name_col]):
+        if name not in unique_videos:
+            unique_videos[name] = row_idx
+    unique_video_list = list(unique_videos.items())  # [(video_name, row_idx), ...]
+    print(f"Dataset rows: {len(ds)} → unique videos: {len(unique_video_list)}")
+
     assert 0 <= args.shard_id < args.num_shards, \
         f"shard_id={args.shard_id} must be in [0, num_shards={args.num_shards})"
 
-    n_total = len(ds) if args.max_samples == -1 else min(args.max_samples, len(ds))
+    n_total = len(unique_video_list) if args.max_samples == -1 \
+        else min(args.max_samples, len(unique_video_list))
 
-    # Compute the contiguous slice of global indices this machine owns.
-    # Indices are assigned as evenly as possible; the last shard absorbs any remainder.
+    # Shard over unique videos; last shard absorbs any remainder.
     shard_size = n_total // args.num_shards
     start_idx = args.shard_id * shard_size
     end_idx = n_total if args.shard_id == args.num_shards - 1 else start_idx + shard_size
-    my_indices = range(start_idx, end_idx)
+    my_videos = unique_video_list[start_idx:end_idx]
 
     print(
         f"Shard {args.shard_id}/{args.num_shards}: "
-        f"global indices [{start_idx}, {end_idx}) — {len(my_indices)} samples → {out_dir}"
+        f"{len(my_videos)} unique videos → {out_dir}"
     )
 
     n_saved = 0
     n_errors = 0
 
-    for global_idx in tqdm(my_indices, desc=f"Shard {args.shard_id}"):
-        # Filename is the global dataset index — unique across all machines.
-        out_path = out_dir / f"{global_idx:07d}.pt"
+    for video_name, row_idx in tqdm(my_videos, desc=f"Shard {args.shard_id}"):
+        # Filename is the video name — unique, human-readable, and collision-free across shards.
+        safe_name = video_name.replace("/", "_").replace(" ", "_")
+        out_path = out_dir / f"{safe_name}.pt"
         if out_path.exists():
             n_saved += 1
             continue  # resume support
 
-        sample = ds[global_idx]
-        result, err = extract_one(sample, backbone, processor, args.max_frames)
+        sample = ds[row_idx]
+        result, err = extract_one(sample, backbone, processor, args.sample_fps, args.max_frames)
 
         if err is not None:
-            print(f"[WARN] Sample {global_idx}: {err}")
+            print(f"[WARN] {video_name}: {err}")
             n_errors += 1
             continue
 

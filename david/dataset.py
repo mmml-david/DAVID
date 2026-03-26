@@ -17,7 +17,8 @@ def _load_cached_feature(path: str) -> dict:
     """Load a cached feature file saved by extract_features.py."""
     data = torch.load(path, map_location="cpu", weights_only=True)
     features = data["features"].float()  # cast from float16 to float32
-    mask = data["mask"]
+    # Mask is not stored — each file is a single complete video so all tokens are valid.
+    mask = torch.ones(features.shape[0], dtype=torch.bool)
     return {"features": features, "mask": mask}
 
 
@@ -37,10 +38,12 @@ class PerceptionTestVideoDataset(Dataset):
         hf_dataset_name: str = "chancharikm/QualityCheck",
         subset: str = "PerceptionTest",
         backbone=None,
-        max_frames: int = 8,
+        sample_fps: float = 1.0,
+        max_frames: int = 64,
     ):
         self.mode = mode
         self.split = split
+        self.sample_fps = sample_fps
 
         if mode == "cached":
             cache_path = Path(feature_cache_dir) / split
@@ -118,12 +121,11 @@ class PerceptionTestVideoDataset(Dataset):
         else:
             vr = decord.VideoReader(video_source, ctx=decord.cpu(0))
 
+        video_fps = vr.get_avg_fps()
         total_frames = len(vr)
-        indices = _sample_frame_indices(total_frames, self.max_frames)
+        indices = _sample_frame_indices_at_fps(total_frames, video_fps, self.sample_fps, self.max_frames)
         frames = vr.get_batch(indices).asnumpy()  # [T, H, W, C]
 
-        # Build message format for Qwen3-VL processor
-        # Save frames temporarily as numpy arrays for process_vision_info
         # qwen_vl_utils expects each frame to be path/url/PIL.Image in list/tuple form.
         frame_list = [Image.fromarray(frame) for frame in frames]
         messages = [
@@ -132,8 +134,8 @@ class PerceptionTestVideoDataset(Dataset):
                 "content": [
                     {
                         "type": "video",
-                        "video": frame_list,  # list of numpy arrays [H, W, C]
-                        "fps": 1.0,
+                        "video": frame_list,
+                        "fps": self.sample_fps,
                     },
                     {"type": "text", "text": "Describe the video."},
                 ],
@@ -178,9 +180,10 @@ class PerceptionTestVideoDataset(Dataset):
         return {"features": features, "mask": mask}
 
 
-def _sample_frame_indices(total_frames: int, n_frames: int) -> list[int]:
-    """Uniformly sample n_frames indices from [0, total_frames)."""
-    if total_frames <= n_frames:
-        return list(range(total_frames))
-    step = total_frames / n_frames
-    return [int(i * step) for i in range(n_frames)]
+def _sample_frame_indices_at_fps(
+    total_frames: int, video_fps: float, sample_fps: float, max_frames: int
+) -> list[int]:
+    """Return frame indices sampled at sample_fps, capped at max_frames."""
+    stride = video_fps / sample_fps
+    n = min(int(total_frames / stride), max_frames)
+    return [int(i * stride) for i in range(n)]

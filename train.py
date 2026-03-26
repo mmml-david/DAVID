@@ -136,6 +136,7 @@ def main():
             hf_dataset_name=cfg.data.dataset_name,
             subset=cfg.data.subset,
             backbone=backbone,
+            sample_fps=cfg.data.sample_fps,
             max_frames=cfg.data.max_frames,
         )
     else:
