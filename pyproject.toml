@@ -1,0 +1,20 @@
+[project]
+name = "david"
+version = "0.1.0"
+description = "Dynamic Adaptive Video Inference and Decoding"
+requires-python = ">=3.11"
+dependencies = [
+    "torch>=2.3.0,<2.11.0",
+    "torchvision>=0.18.0,<0.22.0",
+    "transformers>=4.49.0",
+    "accelerate>=0.30.0",
+    "datasets>=2.19.0",
+    "huggingface-hub>=0.23.0",
+    "qwen-vl-utils>=0.0.8",
+    "decord>=0.6.0",
+    "einops>=0.8.0",
+    "wandb>=0.17.0",
+    "pyyaml>=6.0",
+    "tqdm>=4.66.0",
+    "pillow>=10.0.0",
+]
