@@ -135,6 +135,39 @@ def sample_frame_indices_at_fps(
     return [int(i * stride) for i in range(n)]
 
 
+def _ensure_symlink(path: str) -> str:
+    """Recreate a missing HF hub snapshot symlink from the already-downloaded local blob.
+
+    The hub cache stores files as content-addressed blobs and exposes them via a
+    symlink tree under snapshots/.  If the symlink is missing (e.g. interrupted
+    snapshot_download) but the blob exists, hf_hub_download with local_files_only=True
+    will recreate the symlink with no network I/O.
+
+    Path format: <hub_cache>/datasets--<owner>--<repo>/snapshots/<revision>/<filename>
+    """
+    from huggingface_hub import hf_hub_download
+    from huggingface_hub.utils import EntryNotFoundError, LocalEntryNotFoundError
+
+    parts = path.split("/snapshots/")
+    if len(parts) != 2:
+        return path
+    repo_dir = parts[0].rsplit("/", 1)
+    hub_cache, repo_folder = repo_dir[0], repo_dir[1]  # e.g. datasets--owner--repo
+    _, owner, repo = repo_folder.split("--", 2)
+    revision, filename = parts[1].split("/", 1)
+    try:
+        return hf_hub_download(
+            repo_id=f"{owner}/{repo}",
+            filename=filename,
+            repo_type="dataset",
+            revision=revision,
+            cache_dir=hub_cache,
+            local_files_only=True,
+        )
+    except (EntryNotFoundError, LocalEntryNotFoundError):
+        return path  # blob not present; caller will get a decord error
+
+
 def extract_one(sample, backbone, processor, sample_fps: float, max_frames: int):
     """Extract Qwen3-VL features from a single dataset sample."""
     import decord
@@ -155,7 +188,10 @@ def extract_one(sample, backbone, processor, sample_fps: float, max_frames: int)
         if isinstance(video_source, dict):
             # datasets.Video(decode=False) returns {"path": ..., "bytes": ...}
             if video_source.get("path") is not None:
-                vr = decord.VideoReader(video_source["path"], ctx=decord.cpu(0))
+                path = video_source["path"]
+                if not os.path.exists(path):
+                    path = _ensure_symlink(path)
+                vr = decord.VideoReader(path, ctx=decord.cpu(0))
             elif video_source.get("bytes") is not None:
                 vr = decord.VideoReader(io.BytesIO(video_source["bytes"]), ctx=decord.cpu(0))
             else:
@@ -209,19 +245,9 @@ def extract_one(sample, backbone, processor, sample_fps: float, max_frames: int)
     return {"features": features[0].cpu().half()}, None
 
 
-def _find_video_name_col(column_names: list[str]) -> str:
-    """Return the column that identifies unique videos (e.g. 'video_name', 'video_id')."""
-    # Prefer exact matches first, then partial matches.
-    for candidate in ("video_name", "video_id", "videoname", "videoid"):
-        if candidate in column_names:
-            return candidate
-    for col in column_names:
-        if "video" in col.lower() and ("name" in col.lower() or "id" in col.lower()):
-            return col
-    raise ValueError(
-        f"Could not find a video identifier column in {column_names}. "
-        "Set the column name explicitly or check the dataset schema."
-    )
+def _video_name(video_entry: dict) -> str:
+    """Extract the filename stem from a Video(decode=False) dict, e.g. 'video_1'."""
+    return os.path.splitext(os.path.basename(video_entry["path"]))[0]
 
 
 def main():
@@ -260,10 +286,10 @@ def main():
 
     # Deduplicate: PerceptionTest has ~30k rows but only ~11.6k unique videos
     # (multiple QA pairs per video). Build a mapping: video_name → first row index.
-    video_name_col = _find_video_name_col(ds.column_names)
-    print(f"Using '{video_name_col}' as the video identifier column.")
+    # The dataset has a single "video" column; use the filename stem as the unique key.
     unique_videos: dict[str, int] = {}
-    for row_idx, name in enumerate(ds[video_name_col]):
+    for row_idx, entry in enumerate(ds["video"]):
+        name = _video_name(entry)
         if name not in unique_videos:
             unique_videos[name] = row_idx
     unique_video_list = list(unique_videos.items())  # [(video_name, row_idx), ...]
@@ -290,9 +316,7 @@ def main():
     n_errors = 0
 
     for video_name, row_idx in tqdm(my_videos, desc=f"Shard {args.shard_id}"):
-        # Filename is the video name — unique, human-readable, and collision-free across shards.
-        safe_name = video_name.replace("/", "_").replace(" ", "_")
-        out_path = out_dir / f"{safe_name}.pt"
+        out_path = out_dir / f"{video_name}.pt"
         if out_path.exists():
             n_saved += 1
             continue  # resume support

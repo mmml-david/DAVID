@@ -31,11 +31,17 @@ python extract_features.py --config configs/train_config.yaml --shard_id 1
 # ...
 ```
 
-The script automatically deduplicates by video name (PerceptionTest has ~30k rows but
-only ~11.6k unique videos). Output files are named `{video_name}.pt`. Re-runs skip
-already-extracted files, so it is safe to resume or re-run on any shard.
+The script deduplicates by video filename stem (derived from the `video` column path).
+Output files are named `{video_name}.pt`. Re-runs skip already-extracted files, so it
+is safe to resume or re-run on any shard.
 
 **Disk usage:** ~35 GB for the full PerceptionTest set (float16, ~11.6k videos).
+
+**HuggingFace cache setup:** The dataset stores videos as individual files in the hub
+snapshot. If the snapshot symlink tree is incomplete (e.g. interrupted download),
+the extraction script will automatically recreate missing symlinks from already-present
+local blobs with no network I/O. Videos whose blobs are absent will be skipped with a
+warning; re-run after completing the download to fill gaps.
 
 ### 2. Smoke test
 
