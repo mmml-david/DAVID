@@ -5,27 +5,37 @@ A hierarchical video representation that encodes a video as a prefix-ordered seq
 ## Setup
 
 ```bash
-uv venv .venv
+uv sync
 source .venv/bin/activate
-uv pip install -r requirements.txt
 ```
 
 ## Workflow
 
 ### 1. Extract features (one-time)
 
-Run all videos through the frozen Qwen3-VL backbone and cache the features as `.pt` files. This only needs to be done once before training.
+Run all videos through the frozen Qwen3-VL backbone and cache features as `.pt` files.
+All options are read from `configs/train_config.yaml` (`extraction:` section); CLI flags override.
 
 ```bash
-python extract_features.py \
-    --cache_dir ./features_cache \
-    --split train \
-    --max_frames 8 \
-    --model_name Qwen/Qwen3-VL-2B-Instruct \
-    --device cuda
+# Single machine — all settings from config
+python extract_features.py --config configs/train_config.yaml
+
+# Override specific settings
+python extract_features.py --config configs/train_config.yaml \
+    --device cuda:1 --max_samples 100
+
+# Distributed — run on each machine with a unique --shard_id
+# (num_shards is set in the config; shard_id must be provided explicitly)
+python extract_features.py --config configs/train_config.yaml --shard_id 0
+python extract_features.py --config configs/train_config.yaml --shard_id 1
+# ...
 ```
 
-Use `--max_samples N` to limit to N videos (useful for testing).
+The script automatically deduplicates by video name (PerceptionTest has ~30k rows but
+only ~11.6k unique videos). Output files are named `{video_name}.pt`. Re-runs skip
+already-extracted files, so it is safe to resume or re-run on any shard.
+
+**Disk usage:** ~35 GB for the full PerceptionTest set (float16, ~11.6k videos).
 
 ### 2. Smoke test
 
@@ -47,7 +57,7 @@ Resume from the latest checkpoint:
 python train.py --config configs/train_config.yaml --resume
 ```
 
-Train in online mode (extracts features during training — slower, no cache needed):
+Train in online mode (extracts features on-the-fly — slower, no cache needed):
 
 ```bash
 python train.py --config configs/train_config.yaml --online
@@ -57,9 +67,9 @@ python train.py --config configs/train_config.yaml --online
 
 ```
 DAVID/
-├── requirements.txt
+├── pyproject.toml
 ├── configs/
-│   └── train_config.yaml       # All hyperparameters
+│   └── train_config.yaml       # All hyperparameters (model, training, data, extraction, logging)
 ├── david/
 │   ├── backbone.py             # Frozen Qwen3-VL feature extractor
 │   ├── vae.py                  # DAVIDEncoder + DAVIDDecoder + DAVIDVAE
@@ -70,13 +80,28 @@ DAVID/
 └── train.py                    # Main training entry point
 ```
 
+## Configuration
+
+`configs/train_config.yaml` has five sections:
+
+| Section | Purpose |
+|---|---|
+| `model` | Backbone name, VAE dimensions, number of latent tokens `L`, decoder output tokens `N_queries` |
+| `training` | Batch size, learning rate, beta schedule, gradient clipping |
+| `data` | Dataset name, feature cache path, `sample_fps`, `max_frames` |
+| `extraction` | All `extract_features.py` defaults (`num_shards`, `cache_dir`, `device`, etc.) |
+| `logging` | WandB project, checkpoint directory, log/save intervals |
+
 ## Architecture
 
-The DAVID VAE compresses variable-length Qwen3-VL visual features (`[B, N, 2048]`) into `L=64` fixed latent tokens, trained with **Stochastic Prefix Truncation** to enforce coarse-to-fine semantic ordering.
+The DAVID VAE compresses variable-length Qwen3-VL visual features into `L=64` fixed latent tokens, trained with **Stochastic Prefix Truncation** to enforce coarse-to-fine semantic ordering.
 
-- **Encoder**: `L` learned queries cross-attend to `N` visual tokens → `mu`, `logvar` each `[B, L, D]`
-- **Truncation**: sample `m ~ Uniform(1, L)`, keep only `z[:, :m, :]`
+- **Backbone**: Frozen Qwen3-VL-8B vision encoder; outputs `[N, 4096]` post-PatchMerger tokens for a whole video (all frames concatenated). `N` varies by video duration.
+- **Encoder**: `L` learned queries cross-attend to the `N` video tokens → `mu`, `logvar` each `[B, L, D]`
+- **Truncation**: sample `m ~ Uniform(1, L)` during training, keep only `z[:, :m, :]`
 - **Decoder**: `N_queries=256` learned queries cross-attend to `z_prefix` → reconstructed features `[B, 256, D]`
 - **Loss**: `MSE(recon, target) + beta * KL` with beta linearly annealed from 0
+
+Videos are sampled at 1 fps (configurable) so token count reflects actual duration. Batches pad shorter sequences; the encoder ignores padding via attention masking.
 
 At inference, tokens can be truncated at any prefix length for adaptive reasoning under variable token budgets.
