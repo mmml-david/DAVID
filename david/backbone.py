@@ -1,5 +1,7 @@
 """Frozen Qwen3-VL vision backbone for extracting video visual features."""
 
+import gc
+
 import torch
 from torch import Tensor
 from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
@@ -10,10 +12,11 @@ from .utils import pad_sequence_to_max
 class Qwen3VLBackbone:
     """Wraps the Qwen3-VL vision encoder (frozen) and exposes a clean feature extraction API.
 
-    Loads the full Qwen3VLForConditionalGeneration model but only uses the
-    vision encoder (model.model.visual). All parameters are frozen.
+    Loads the full model onto CPU, extracts only the vision encoder
+    (model.model.visual) onto the target device, then frees the LLM weights.
+    This saves ~16 GB of VRAM compared to keeping the full 8B model on GPU.
 
-    Output features come from pooler_output (post-PatchMerger, dim=2048 for 2B model),
+    Output features come from pooler_output (post-PatchMerger, dim=4096 for 8B model),
     which is the representation the LLM actually consumes.
     """
 
@@ -22,20 +25,25 @@ class Qwen3VLBackbone:
         self.dtype = dtype
 
         print(f"Loading Qwen3-VL backbone: {model_name}")
-        self.model = Qwen3VLForConditionalGeneration.from_pretrained(
+        # Load full model onto CPU first, then extract only the vision encoder.
+        model = Qwen3VLForConditionalGeneration.from_pretrained(
             model_name,
             torch_dtype=dtype,
-            device_map=device,
+            device_map="cpu",
         )
         self.processor = AutoProcessor.from_pretrained(model_name)
 
-        # Freeze all backbone parameters
-        for param in self.model.parameters():
+        # Move only the vision encoder to the target device; discard the LLM.
+        self._visual = model.model.visual.to(device)
+        self._visual.eval()
+        for param in self._visual.parameters():
             param.requires_grad_(False)
-        self.model.eval()
 
-        # Expose the vision encoder directly
-        self._visual = self.model.model.visual
+        del model
+        gc.collect()
+        if "cuda" in device:
+            torch.cuda.empty_cache()
+
         print("Backbone loaded and frozen.")
 
     @torch.no_grad()

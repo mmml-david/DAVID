@@ -226,12 +226,15 @@ def extract_one(sample, backbone, processor, sample_fps: float, max_frames: int)
 
     text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     image_inputs, video_inputs, video_kwargs = process_vision_info(messages, return_video_kwargs=True)
-    if isinstance(video_kwargs.get("fps"), list) and len(video_kwargs["fps"]) == 1:
-        video_kwargs["fps"] = video_kwargs["fps"][0]
+    # process_vision_info cannot infer fps from PIL images; provide VideoMetadata
+    # explicitly so Qwen3-VL builds correct per-frame timestamps (idx/fps seconds)
+    # instead of defaulting to 24 fps. Pop fps from video_kwargs to avoid conflict.
+    video_kwargs.pop("fps", None)
 
     inputs = processor(
         text=[text],
         videos=video_inputs,
+        video_metadata=[{"fps": sample_fps, "total_num_frames": len(frame_list), "frames_indices": list(range(len(frame_list)))}],
         **video_kwargs,
         return_tensors="pt",
     )

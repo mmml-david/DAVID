@@ -32,7 +32,7 @@ data:
 extraction:
   dataset_name: "chancharikm/QualityCheck"
   subset: "PerceptionTest"
-  split: "train"
+  split: "validation"
   cache_dir: "/data/user_data/hsuanhal/11777/DAVID/features_cache/perception_test"
   sample_fps: 1.0         # sample 1 frame per second
   max_frames: 64          # safety cap
