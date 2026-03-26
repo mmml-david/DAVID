@@ -1,6 +1,8 @@
+/*.sh
 features_cache/
 checkpoints/
 wandb/
 .venv/
 .DS_Store
 __pycache__/
+logs
