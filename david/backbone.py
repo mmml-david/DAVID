@@ -67,10 +67,10 @@ class Qwen3VLBackbone:
         pixel_values = pixel_values.to(self.device, dtype=self.dtype)
         grid_thw = grid_thw.to(self.device)
 
-        out = self._visual(pixel_values, grid_thw)
+        hidden_states, _deepstack = self._visual(pixel_values, grid_thw)
 
-        # pooler_output: [total_merged_tokens, D]
-        pooler = out.pooler_output  # [total_merged_tokens, D]
+        # hidden_states: [total_merged_tokens, D] (post spatial-merge)
+        pooler = hidden_states  # [total_merged_tokens, D]
 
         # Each video produces T * (H//2) * (W//2) tokens after spatial merge (factor=2)
         N_per_video = [
