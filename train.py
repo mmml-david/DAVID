@@ -48,7 +48,7 @@ def load_config(path: str) -> DotDict:
 
 # ─── Checkpoint helpers ───────────────────────────────────────────────────────
 
-def save_checkpoint(vae, optimizer, step: int, loss: float, checkpoint_dir: str):
+def save_checkpoint(vae, optimizer, ema, step: int, loss: float, checkpoint_dir: str):
     Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
     path = Path(checkpoint_dir) / f"step_{step:07d}.pt"
     torch.save({
@@ -56,11 +56,12 @@ def save_checkpoint(vae, optimizer, step: int, loss: float, checkpoint_dir: str)
         "loss": loss,
         "model_state_dict": vae.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
+        "ema_state_dict": ema.state_dict(),
     }, path)
     print(f"  [Checkpoint] Saved to {path}")
 
 
-def load_checkpoint(vae, optimizer, checkpoint_dir: str):
+def load_checkpoint(vae, optimizer, ema, checkpoint_dir: str):
     """Resume from the latest checkpoint in checkpoint_dir. Returns starting step."""
     ckpts = sorted(Path(checkpoint_dir).glob("step_*.pt"))
     if not ckpts:
@@ -69,6 +70,8 @@ def load_checkpoint(vae, optimizer, checkpoint_dir: str):
     state = torch.load(latest, map_location="cpu", weights_only=False)
     vae.load_state_dict(state["model_state_dict"])
     optimizer.load_state_dict(state["optimizer_state_dict"])
+    if "ema_state_dict" in state:
+        ema.load_state_dict(state["ema_state_dict"])
     print(f"  [Checkpoint] Resumed from {latest} (step {state['step']})")
     return state["step"]
 
@@ -100,12 +103,15 @@ def main():
     from david.vae import DAVIDVAE, DAVIDConfig
     from david.loss import david_loss, BetaScheduler
     from david.dataset import PerceptionTestVideoDataset
+    from david.utils import EMAModel
 
     # ── Model config ──
     david_cfg = DAVIDConfig.from_dict(dict(cfg.model))
     vae = DAVIDVAE(david_cfg).to(device)
     n_params = sum(p.numel() for p in vae.parameters() if p.requires_grad)
     print(f"DAVID VAE parameters: {n_params:,}")
+
+    ema = EMAModel(vae, decay=cfg.training.ema_decay)
 
     # ── Optimizer ──
     optimizer = AdamW(
@@ -169,12 +175,17 @@ def main():
     use_wandb = cfg.logging.use_wandb and not args.smoke_test
     if use_wandb:
         import wandb
-        wandb.init(project=cfg.logging.project, config=dict(cfg))
+        wandb.init(
+            entity=cfg.logging.entity,
+            project=cfg.logging.project,
+            name=cfg.logging.get("run_name") or None,
+            config=dict(cfg),
+        )
 
     # ── Resume ──
     start_step = 0
     if args.resume:
-        start_step = load_checkpoint(vae, optimizer, cfg.logging.checkpoint_dir)
+        start_step = load_checkpoint(vae, optimizer, ema, cfg.logging.checkpoint_dir)
 
     # ── Training loop ──
     max_steps = 2 if args.smoke_test else cfg.training.max_steps
@@ -242,6 +253,7 @@ def main():
                     optimizer.step()
                     scheduler.step()
                     optimizer.zero_grad()
+                    ema.update(vae)
 
                 # Logging
                 if step % cfg.logging.log_every == 0:
@@ -252,6 +264,7 @@ def main():
                         "beta": beta,
                         "truncation/m": output.m,
                         "lr": scheduler.get_last_lr()[0],
+                        "ema_decay": ema.decay,
                     }
                     if use_wandb:
                         wandb.log(metrics, step=step)
@@ -267,7 +280,7 @@ def main():
 
                 # Checkpointing
                 if not args.smoke_test and step > 0 and step % cfg.logging.save_every == 0:
-                    save_checkpoint(vae, optimizer, step, loss_out.total.item(),
+                    save_checkpoint(vae, optimizer, ema, step, loss_out.total.item(),
                                     cfg.logging.checkpoint_dir)
 
                 step += 1
