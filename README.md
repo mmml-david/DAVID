@@ -54,7 +54,11 @@ python train.py --config configs/train_config.yaml --smoke_test
 ### 3. Train
 
 ```bash
+# Single GPU
 python train.py --config configs/train_config.yaml
+
+# Multi-GPU via torchrun
+torchrun --nproc_per_node=4 train.py --config configs/train_config.yaml
 ```
 
 Resume from the latest checkpoint:
@@ -67,6 +71,18 @@ Train in online mode (extracts features on-the-fly — slower, no cache needed):
 
 ```bash
 python train.py --config configs/train_config.yaml --online
+```
+
+Override the WandB run name:
+
+```bash
+python train.py --config configs/train_config.yaml --run_name my-experiment
+```
+
+For the Qwen3-VL-2B model (lower VRAM, online mode):
+
+```bash
+python train.py --config configs/train_config_2b_online.yaml --online
 ```
 
 ### 4. Evaluate VQA (Qwen3-VL and DAVID+VAE)
@@ -127,16 +143,19 @@ The script writes JSONL predictions and a summary JSON under `./eval_outputs/`.
 ```
 DAVID/
 ├── pyproject.toml
+├── perception_test.json         # Per-sample VQA questions for evaluation
 ├── configs/
-│   └── train_config.yaml       # All hyperparameters (model, training, data, extraction, logging)
+│   ├── train_config.yaml        # 8B model — cached feature training
+│   └── train_config_2b_online.yaml  # 2B model — online mode, lower VRAM
 ├── david/
-│   ├── backbone.py             # Frozen Qwen3-VL vision encoder (LLM weights discarded)
-│   ├── vae.py                  # DAVIDEncoder + DAVIDDecoder + DAVIDVAE (self-attention)
-│   ├── dataset.py              # Dataset loader (cached and online modes)
-│   ├── loss.py                 # Adaptive recon loss + KL + beta warm-up scheduler
-│   └── utils.py                # Padding, masking, interpolation helpers
-├── extract_features.py         # One-time offline feature extraction
-└── train.py                    # Main training entry point
+│   ├── backbone.py              # Frozen Qwen3-VL vision encoder (LLM weights discarded)
+│   ├── vae.py                   # DAVIDEncoder + DAVIDDecoder + DAVIDVAE (self-attention)
+│   ├── dataset.py               # Dataset loader (cached and online modes)
+│   ├── loss.py                  # Adaptive recon loss + KL + beta warm-up scheduler
+│   └── utils.py                 # Padding, masking, interpolation helpers + EMAModel
+├── extract_features.py          # One-time offline feature extraction
+├── evaluate_vqa.py              # VQA accuracy evaluation (Qwen3-VL and DAVID+VAE)
+└── train.py                     # Main training entry point (single-GPU and DDP)
 ```
 
 ## Configuration
@@ -145,11 +164,15 @@ DAVID/
 
 | Section | Purpose |
 |---|---|
-| `model` | Backbone name, `input_dim`, encoder/decoder layers, `progressive_ratio` |
-| `training` | Batch size, learning rate, beta schedule, gradient clipping |
-| `data` | Dataset name, feature cache path, `sample_fps`, `max_frames` |
+| `model` | Backbone name, `input_dim`, encoder/decoder layers, `progressive_ratio`, `grad_checkpoint` |
+| `training` | Batch size, learning rate, beta schedule, gradient clipping, `ema_decay` |
+| `data` | Dataset name, feature cache path, `sample_fps`, `max_frames`, `min_pixels`/`max_pixels` |
 | `extraction` | All `extract_features.py` defaults (`num_shards`, `cache_dir`, `device`, etc.) |
-| `logging` | WandB project, checkpoint directory, log/save intervals |
+| `logging` | WandB entity/project/`run_name`, checkpoint directory, `log_every`, `eval_every`, `max_val_samples`, `save_every` |
+
+Two configs are provided:
+- `configs/train_config.yaml` — Qwen3-VL-8B, cached feature training (requires extracted features)
+- `configs/train_config_2b_online.yaml` — Qwen3-VL-2B, online mode with lower resolution (`min_pixels=16384`, `max_pixels=204800`)
 
 ## Architecture
 
@@ -166,3 +189,5 @@ DAVID/
 - `beta` is linearly annealed from 0 to `beta_target` over `beta_warmup_steps` to prevent posterior collapse.
 
 At inference, tokens can be truncated at any prefix length for adaptive reasoning under variable token budgets.
+
+**Training infrastructure** (`train.py`): Single-GPU or multi-GPU via `torchrun` (DDP). `bfloat16` autocast wraps forward and loss. EMA (`decay=0.999`) tracks a shadow copy of VAE weights and is saved in checkpoints. Validation runs every `eval_every` steps (MSE only); `best.pt` is saved on improvement alongside the regular `step_N.pt` checkpoint.
