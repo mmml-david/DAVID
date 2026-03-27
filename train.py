@@ -16,6 +16,7 @@ Usage:
 
 import argparse
 import os
+import multiprocessing as mp
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -196,22 +197,38 @@ def main():
         )
     dbg(f"Dataset ready: size={len(dataset)}")
 
+    num_workers = 0 if args.smoke_test else cfg.data.num_workers
+    if args.online and num_workers > 0:
+        print(
+            "[DataLoader] online mode runs CUDA feature extraction inside __getitem__; "
+            "forcing num_workers=0 to avoid CUDA-in-subprocess errors."
+        )
+        num_workers = 0
+
     # DistributedSampler ensures each rank gets different data shards
     sampler = None
     if world_size > 1 and not args.smoke_test:
         sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
 
-    loader = DataLoader(
-        dataset,
-        batch_size=cfg.training.batch_size,
-        shuffle=(sampler is None) and not args.smoke_test,
-        sampler=sampler,
-        collate_fn=None if args.smoke_test else PerceptionTestVideoDataset.collate_fn,
-        num_workers=0 if args.smoke_test else cfg.data.num_workers,
-        pin_memory=(str(device).startswith("cuda")),
-        drop_last=True,
+    loader_kwargs = {
+        "batch_size": cfg.training.batch_size,
+        "shuffle": (sampler is None) and not args.smoke_test,
+        "sampler": sampler,
+        "collate_fn": None if args.smoke_test else PerceptionTestVideoDataset.collate_fn,
+        "num_workers": num_workers,
+        "pin_memory": (str(device).startswith("cuda")),
+        "drop_last": True,
+    }
+    if str(device).startswith("cuda") and num_workers > 0:
+        # Linux default is "fork", which can break when workers touch CUDA state.
+        loader_kwargs["multiprocessing_context"] = mp.get_context("spawn")
+
+    loader = DataLoader(dataset, **loader_kwargs)
+    dbg(
+        f"DataLoader ready: batch_size={cfg.training.batch_size}, "
+        f"num_workers={num_workers}, "
+        f"mp_ctx={'spawn' if str(device).startswith('cuda') and num_workers > 0 else 'default'}"
     )
-    dbg(f"DataLoader ready: batch_size={cfg.training.batch_size}, num_workers={0 if args.smoke_test else cfg.data.num_workers}")
 
     # ── WandB (main process only) ──
     use_wandb = cfg.logging.use_wandb and not args.smoke_test and is_main

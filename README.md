@@ -69,6 +69,30 @@ Train in online mode (extracts features on-the-fly — slower, no cache needed):
 python train.py --config configs/train_config.yaml --online
 ```
 
+### 4. Evaluate VQA sanity prompts (Qwen3-VL and DAVID+VAE)
+
+Run caption-style prompting on PerceptionTest videos (defaults to `split=validation`):
+
+```bash
+# Baseline Qwen3-VL only
+python evaluate_vqa.py \
+    --method qwen \
+    --split validation \
+    --max_samples 100 \
+    --prompt "What is the video caption?"
+
+# Side-by-side comparison (Qwen3-VL + DAVID reconstruction)
+python evaluate_vqa.py \
+    --method both \
+    --split validation \
+    --max_samples 100 \
+    --prompt "What is the video caption?" \
+    --vae_checkpoint ./checkpoints/step_0050000.pt
+```
+
+The script writes JSONL predictions and a summary JSON under `./eval_outputs/`.
+Note: the `chancharikm/QualityCheck` PerceptionTest subset currently exposes `train` and `validation` splits.
+
 ## Project Structure
 
 ```
