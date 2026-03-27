@@ -188,6 +188,8 @@ def main():
             backbone=backbone,
             sample_fps=cfg.data.sample_fps,
             max_frames=cfg.data.max_frames,
+            min_pixels=getattr(cfg.data, 'min_pixels', None),
+            max_pixels=getattr(cfg.data, 'max_pixels', None),
         )
     else:
         dataset = PerceptionTestVideoDataset(

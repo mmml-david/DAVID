@@ -61,6 +61,10 @@ def parse_args():
                         help="Frames per second to sample from each video")
     parser.add_argument("--max_frames", type=int, default=None,
                         help="Safety cap on frames per video (in case of very long videos)")
+    parser.add_argument("--min_pixels", type=int, default=None,
+                        help="Minimum pixel budget for video frame resizing")
+    parser.add_argument("--max_pixels", type=int, default=None,
+                        help="Maximum pixel budget for video frame resizing")
     parser.add_argument("--model_name", default=None)
     parser.add_argument("--device", default=None)
     parser.add_argument("--max_samples", type=int, default=None,
@@ -92,6 +96,8 @@ def resolve_args(args, config_path: str) -> argparse.Namespace:
         "dataset_name": "chancharikm/QualityCheck",
         "sample_fps": 1.0,
         "max_frames": 64,
+        "min_pixels": None,
+        "max_pixels": None,
         "model_name": "Qwen/Qwen3-VL-8B-Instruct",
         "device": "cuda",
         "max_samples": -1,
@@ -168,7 +174,8 @@ def _ensure_symlink(path: str) -> str:
         return path  # blob not present; caller will get a decord error
 
 
-def extract_one(sample, backbone, processor, sample_fps: float, max_frames: int):
+def extract_one(sample, backbone, processor, sample_fps: float, max_frames: int,
+                min_pixels: int | None = None, max_pixels: int | None = None):
     """Extract Qwen3-VL features from a single dataset sample."""
     import decord
     from PIL import Image
@@ -231,13 +238,21 @@ def extract_one(sample, backbone, processor, sample_fps: float, max_frames: int)
     # instead of defaulting to 24 fps. Pop fps from video_kwargs to avoid conflict.
     video_kwargs.pop("fps", None)
 
-    inputs = processor(
+    processor_kwargs = dict(
         text=[text],
         videos=video_inputs,
         video_metadata=[{"fps": sample_fps, "total_num_frames": len(frame_list), "frames_indices": list(range(len(frame_list)))}],
         **video_kwargs,
         return_tensors="pt",
     )
+    if min_pixels is not None or max_pixels is not None:
+        vk = {}
+        if min_pixels is not None:
+            vk["min_pixels"] = min_pixels
+        if max_pixels is not None:
+            vk["max_pixels"] = max_pixels
+        processor_kwargs["videos_kwargs"] = vk
+    inputs = processor(**processor_kwargs)
 
     pixel_values = inputs["pixel_values_videos"]
     grid_thw = inputs["video_grid_thw"]
@@ -260,6 +275,8 @@ def main():
     print(f"  dataset={args.dataset_name}/{args.subset}  split={args.split}")
     print(f"  cache_dir={args.cache_dir}  model={args.model_name}  device={args.device}")
     print(f"  sample_fps={args.sample_fps}  max_frames={args.max_frames}  max_samples={args.max_samples}")
+    if args.min_pixels is not None or args.max_pixels is not None:
+        print(f"  min_pixels={args.min_pixels}  max_pixels={args.max_pixels}")
     print(f"  shard={args.shard_id}/{args.num_shards}")
 
     from datasets import Video, load_dataset
@@ -325,7 +342,8 @@ def main():
             continue  # resume support
 
         sample = ds[row_idx]
-        result, err = extract_one(sample, backbone, processor, args.sample_fps, args.max_frames)
+        result, err = extract_one(sample, backbone, processor, args.sample_fps, args.max_frames,
+                                  args.min_pixels, args.max_pixels)
 
         if err is not None:
             print(f"[WARN] {video_name}: {err}")
