@@ -45,7 +45,7 @@ warning; re-run after completing the download to fill gaps.
 
 ### 2. Smoke test
 
-Verify the full pipeline (shapes, loss computation) with a single batch and no WandB logging:
+Verify the full pipeline using synthetic data (no backbone or cache needed):
 
 ```bash
 python train.py --config configs/train_config.yaml --smoke_test
@@ -77,10 +77,10 @@ DAVID/
 ├── configs/
 │   └── train_config.yaml       # All hyperparameters (model, training, data, extraction, logging)
 ├── david/
-│   ├── backbone.py             # Frozen Qwen3-VL feature extractor
-│   ├── vae.py                  # DAVIDEncoder + DAVIDDecoder + DAVIDVAE
+│   ├── backbone.py             # Frozen Qwen3-VL vision encoder (LLM weights discarded)
+│   ├── vae.py                  # DAVIDEncoder + DAVIDDecoder + DAVIDVAE (self-attention)
 │   ├── dataset.py              # Dataset loader (cached and online modes)
-│   ├── loss.py                 # MSE + KL loss + beta warm-up scheduler
+│   ├── loss.py                 # Adaptive recon loss + KL + beta warm-up scheduler
 │   └── utils.py                # Padding, masking, interpolation helpers
 ├── extract_features.py         # One-time offline feature extraction
 └── train.py                    # Main training entry point
@@ -92,7 +92,7 @@ DAVID/
 
 | Section | Purpose |
 |---|---|
-| `model` | Backbone name, VAE dimensions, number of latent tokens `L`, decoder output tokens `N_queries` |
+| `model` | Backbone name, `input_dim`, encoder/decoder layers, `progressive_ratio` |
 | `training` | Batch size, learning rate, beta schedule, gradient clipping |
 | `data` | Dataset name, feature cache path, `sample_fps`, `max_frames` |
 | `extraction` | All `extract_features.py` defaults (`num_shards`, `cache_dir`, `device`, etc.) |
@@ -100,14 +100,16 @@ DAVID/
 
 ## Architecture
 
-The DAVID VAE compresses variable-length Qwen3-VL visual features into `L=64` fixed latent tokens, trained with **Stochastic Prefix Truncation** to enforce coarse-to-fine semantic ordering.
+**Backbone** (`backbone.py`): Loads only the Qwen3-VL-8B vision encoder onto GPU and discards the LLM weights (~16 GB VRAM saving). Videos are sampled at 1 fps and processed as a whole, producing a flat `[N, 4096]` token sequence where N varies with video duration.
 
-- **Backbone**: Frozen Qwen3-VL-8B vision encoder; outputs `[N, 4096]` post-PatchMerger tokens for a whole video (all frames concatenated). `N` varies by video duration.
-- **Encoder**: `L` learned queries cross-attend to the `N` video tokens → `mu`, `logvar` each `[B, L, D]`
-- **Truncation**: sample `m ~ Uniform(1, L)` during training, keep only `z[:, :m, :]`
-- **Decoder**: `N_queries=256` learned queries cross-attend to `z_prefix` → reconstructed features `[B, 256, D]`
-- **Loss**: `MSE(recon, target) + beta * KL` with beta linearly annealed from 0
+**DAVID VAE** (`vae.py`): All three stages — input, latent, output — share the same `[B, N, D]` shape.
 
-Videos are sampled at 1 fps (configurable) so token count reflects actual duration. Batches pad shorter sequences; the encoder ignores padding via attention masking.
+- **Encoder**: self-attention blocks over the full video token sequence (padding masked). Optional `progressive_ratio` causes later tokens to attend to progressively fewer random peers, strengthening the coarse-to-fine ordering incentive. Outputs `mu, logvar` at `[B, N, D]`.
+- **Truncation**: sample `m ~ Uniform(1, N)` during training; zero-pad z beyond position m before decoding. This forces early tokens to carry coarse information and later tokens to carry refinements.
+- **Decoder**: self-attention blocks over the zero-padded z; outputs reconstructed features `[B, N, D]`.
+
+**Loss** (`loss.py`): `recon_loss + beta * KL`
+- `recon_loss` is adaptive: exponent `p` and scale `s` both equal `2 * sigmoid(m/N)`, smoothly transitioning from L1 (small prefix → coarse reconstruction) to L2 (full prefix → precise reconstruction).
+- `beta` is linearly annealed from 0 to `beta_target` over `beta_warmup_steps` to prevent posterior collapse.
 
 At inference, tokens can be truncated at any prefix length for adaptive reasoning under variable token budgets.
