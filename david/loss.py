@@ -1,5 +1,6 @@
 """Loss functions and beta scheduler for DAVID VAE training."""
 
+import math
 import torch
 from torch import Tensor
 from dataclasses import dataclass
@@ -99,3 +100,31 @@ class BetaScheduler:
             return self.beta_target
         progress = (step - self.warmup_start) / (self.warmup_end - self.warmup_start)
         return self.beta_target * progress
+
+
+class MRatioScheduler:
+    """Linear schedule for prefix sampling ratio used by m ~ Uniform(1, floor(N * ratio)).
+
+    ratio = ratio_start for steps 0..warmup_start
+    ratio linearly ramps to ratio_end over warmup_start..warmup_end
+    ratio = ratio_end for steps > warmup_end
+    """
+
+    def __init__(self, ratio_start: float, ratio_end: float, warmup_start: int, warmup_end: int):
+        self.ratio_start = float(max(0.0, min(1.0, ratio_start)))
+        self.ratio_end = float(max(0.0, min(1.0, ratio_end)))
+        self.warmup_start = warmup_start
+        self.warmup_end = warmup_end
+
+    def get_ratio(self, step: int) -> float:
+        if step <= self.warmup_start:
+            return self.ratio_start
+        if step >= self.warmup_end:
+            return self.ratio_end
+        progress = (step - self.warmup_start) / (self.warmup_end - self.warmup_start)
+        return self.ratio_start + progress * (self.ratio_end - self.ratio_start)
+
+    def sample_m(self, step: int, n_tokens: int) -> int:
+        ratio = self.get_ratio(step)
+        upper = min(n_tokens, max(1, math.floor(n_tokens * ratio)))
+        return torch.randint(1, upper + 1, (1,)).item()

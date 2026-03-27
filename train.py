@@ -127,7 +127,7 @@ def main():
 
     # ── Imports (deferred so smoke tests don't require full deps) ──
     from david.vae import DAVIDVAE, DAVIDConfig
-    from david.loss import david_loss, BetaScheduler
+    from david.loss import david_loss, BetaScheduler, MRatioScheduler
     from david.dataset import PerceptionTestVideoDataset
     from david.utils import EMAModel
 
@@ -161,6 +161,15 @@ def main():
         beta_target=cfg.training.beta_target,
         warmup_start=cfg.training.warmup_steps,
         warmup_end=cfg.training.warmup_steps + cfg.training.beta_warmup_steps,
+    )
+    m_ratio_start = cfg.training.get("m_ratio_start", 1.0)
+    m_ratio_warmup_start = cfg.training.get("m_ratio_warmup_start", 0)
+    m_ratio_warmup_steps = cfg.training.get("m_ratio_warmup_steps", 0)
+    m_sched = MRatioScheduler(
+        ratio_start=m_ratio_start,
+        ratio_end=1.0,
+        warmup_start=m_ratio_warmup_start,
+        warmup_end=m_ratio_warmup_start + m_ratio_warmup_steps,
     )
 
     # ── Dataset ──
@@ -297,7 +306,8 @@ def main():
 
             # Sample m once on rank 0, broadcast to all ranks for DDP correctness
             N = features.shape[1]
-            m = torch.randint(1, N + 1, (1,)).item()
+            m = m_sched.sample_m(step, N)
+            m_ratio = m_sched.get_ratio(step)
             if is_dist:
                 m_t = torch.tensor([m], dtype=torch.long, device=device)
                 dist.broadcast(m_t, src=0)
@@ -343,6 +353,7 @@ def main():
                     "loss/kl": loss_out.kl,
                     "beta": beta,
                     "truncation/m": output.m,
+                    "truncation/ratio": m_ratio,
                     "lr": scheduler.get_last_lr()[0],
                     "ema_decay": ema.decay,
                 }

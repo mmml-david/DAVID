@@ -1,7 +1,7 @@
 model:
-  backbone_name: "Qwen/Qwen3-VL-2B-Instruct"
+  backbone_name: "Qwen/Qwen3-VL-8B-Instruct"
   backbone_dtype: "bfloat16"
-  input_dim: 2048         # Qwen3-VL-2B pooler_output dim (= latent dim)
+  input_dim: 4096         # Qwen3-VL-2B pooler_output dim (= latent dim)
   n_encoder_layers: 4
   n_decoder_layers: 4
   n_heads: 16
@@ -18,13 +18,16 @@ training:
   warmup_steps: 1000
   beta_target: 1.0e-4
   beta_warmup_steps: 10000
+  m_ratio_start: 0.2        # m ~ Uniform(1, floor(N * ratio)); ratio ramps to 1.0
+  m_ratio_warmup_start: 0 
+  m_ratio_warmup_steps: 1000 
   grad_clip: 1.0
   ema_decay: 0.999
 
 data:
   dataset_name: "chancharikm/QualityCheck"
   subset: "PerceptionTest"
-  feature_cache_dir: "/data/user_data/hsuanhal/11777/DAVID/2B_features_cache/perception_test"
+  feature_cache_dir: "/data/user_data/hsuanhal/11777/DAVID/features_cache/perception_test"
   sample_fps: 1.0         # sample 1 frame per second; videos vary in length so token count varies per video
   max_frames: 64          # safety cap to avoid OOM on unusually long videos
   num_workers: 4
@@ -33,10 +36,10 @@ extraction:
   dataset_name: "chancharikm/QualityCheck"
   subset: "PerceptionTest"
   split: "validation"
-  cache_dir: "/data/user_data/hsuanhal/11777/DAVID/2B_features_cache/perception_test"
+  cache_dir: "/data/user_data/hsuanhal/11777/DAVID/features_cache/perception_test"
   sample_fps: 1.0         # sample 1 frame per second
   max_frames: 64          # safety cap
-  model_name: "Qwen/Qwen3-VL-2B-Instruct"
+  model_name: "Qwen/Qwen3-VL-8B-Instruct"
   device: "cuda"
   max_samples: -1         # -1 = all samples
   num_shards: 8
@@ -48,6 +51,6 @@ logging:
   project: "DAVID"
   run_name: null  # set to a string to name the run, e.g. "baseline-lr1e4"; null = wandb auto-names it
   log_every: 50
-  eval_every: 1000
-  save_every: 5000
-  checkpoint_dir: "./checkpoints"
+  eval_every: 500
+  save_every: 1000
+  checkpoint_dir: "/data/user_data/hsuanhal/11777/DAVID/checkpoints"
