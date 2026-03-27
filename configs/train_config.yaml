@@ -42,6 +42,7 @@ extraction:
 
 logging:
   use_wandb: true
+  wandb_entity: "mmml-david"
   project: "DAVID"
   log_every: 50
   eval_every: 1000

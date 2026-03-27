@@ -169,7 +169,11 @@ def main():
     use_wandb = cfg.logging.use_wandb and not args.smoke_test
     if use_wandb:
         import wandb
-        wandb.init(project=cfg.logging.project, config=dict(cfg))
+        wandb.init(
+            entity=getattr(cfg.logging, "wandb_entity", None),
+            project=cfg.logging.project,
+            config=dict(cfg),
+        )
 
     # ── Resume ──
     start_step = 0
