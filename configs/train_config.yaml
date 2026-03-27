@@ -1,14 +1,12 @@
 model:
   backbone_name: "Qwen/Qwen3-VL-8B-Instruct"
   backbone_dtype: "bfloat16"
-  input_dim: 4096         # Qwen3-VL-8B pooler_output dim
-  latent_dim: 2048
-  L: 64                   # number of DAVID latent tokens
-  N_queries: 256          # fixed decoder output tokens
+  input_dim: 4096         # Qwen3-VL-8B pooler_output dim (= latent dim)
   n_encoder_layers: 4
   n_decoder_layers: 4
   n_heads: 16
   dropout: 0.1
+  progressive_ratio: 0.0    # 0.0 = no mask, 0.5 = token N-1 sees ~N/2 random, 1.0 = sees ~1 random
 
 training:
   batch_size: 8

@@ -100,7 +100,6 @@ def main():
     from david.vae import DAVIDVAE, DAVIDConfig
     from david.loss import david_loss, BetaScheduler
     from david.dataset import PerceptionTestVideoDataset
-    from david.utils import interpolate_features
 
     # ── Model config ──
     david_cfg = DAVIDConfig.from_dict(dict(cfg.model))
@@ -122,7 +121,15 @@ def main():
     )
 
     # ── Dataset ──
-    if args.online:
+    if args.smoke_test:
+        from torch.utils.data import TensorDataset
+        D = david_cfg.input_dim
+        N = 16  # synthetic sequence length
+        B_total = cfg.training.batch_size * 2
+        fake_features = torch.randn(B_total, N, D)
+        fake_mask = torch.ones(B_total, N, dtype=torch.bool)
+        dataset = TensorDataset(fake_features, fake_mask)
+    elif args.online:
         from david.backbone import Qwen3VLBackbone
         backbone = Qwen3VLBackbone(
             model_name=cfg.model.backbone_name,
@@ -145,13 +152,13 @@ def main():
             split="train",
             mode="cached",
         )
-    dbg(f"Dataset ready: mode={'online' if args.online else 'cached'}, size={len(dataset)}")
+    dbg(f"Dataset ready: size={len(dataset)}")
 
     loader = DataLoader(
         dataset,
         batch_size=cfg.training.batch_size,
         shuffle=True,
-        collate_fn=PerceptionTestVideoDataset.collate_fn,
+        collate_fn=None if args.smoke_test else PerceptionTestVideoDataset.collate_fn,
         num_workers=0 if args.smoke_test else cfg.data.num_workers,
         pin_memory=(device == "cuda"),
         drop_last=True,
@@ -172,7 +179,6 @@ def main():
     # ── Training loop ──
     max_steps = 2 if args.smoke_test else cfg.training.max_steps
     grad_accum = cfg.training.gradient_accumulation_steps
-    N_queries = david_cfg.N_queries
 
     step = start_step
     optimizer.zero_grad()
@@ -197,8 +203,10 @@ def main():
                     break
                 dbg("Batch fetched")
 
-                features = batch["features"].to(device)  # [B, N, D]
-                mask = batch["mask"].to(device)          # [B, N]
+                if isinstance(batch, (list, tuple)):
+                    features, mask = batch[0].to(device), batch[1].to(device)
+                else:
+                    features, mask = batch["features"].to(device), batch["mask"].to(device)
                 feature_dim = features.shape[-1]
                 if feature_dim != david_cfg.input_dim:
                     raise ValueError(
@@ -211,16 +219,12 @@ def main():
                 dbg("Running model forward")
                 output = vae(features, mask, training=True)
 
-                # Build reconstruction target by interpolating features to N_queries
-                target = interpolate_features(features, N_queries)  # [B, N_queries, D]
-                target = target.detach()
-
-                # Compute loss
+                # Compute loss (reconstruct original features, masked for padding)
                 dbg("Computing loss")
                 beta = beta_sched.get_beta(step)
                 loss_out = david_loss(
                     recon=output.recon,
-                    target=target,
+                    target=features,
                     mu=output.mu,
                     logvar=output.logvar,
                     beta=beta,
