@@ -1,22 +1,20 @@
-"""DAVID VAE: encoder, decoder, and full model with stochastic prefix truncation."""
+"""DAVID VAE: self-attention encoder/decoder with stochastic prefix truncation."""
 
 import torch
 import torch.nn as nn
 from torch import Tensor
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass
 class DAVIDConfig:
-    input_dim: int = 2048       # Qwen3-VL pooler_output dim
-    latent_dim: int = 2048      # latent space dim (same as input for easy init)
-    L: int = 64                 # number of DAVID latent tokens
-    N_queries: int = 256        # fixed number of decoder output tokens
+    input_dim: int = 4096       # Qwen3-VL pooler_output dim (= latent dim)
     n_encoder_layers: int = 4
     n_decoder_layers: int = 4
     n_heads: int = 16
     dropout: float = 0.1
-    ffn_multiplier: int = 4     # FFN hidden dim = latent_dim * ffn_multiplier
+    ffn_multiplier: int = 4
+    progressive_ratio: float = 0.0  # 0.0 = no mask, 1.0 = token N-1 sees ~1 random token
 
     @classmethod
     def from_dict(cls, d: dict) -> "DAVIDConfig":
@@ -25,19 +23,43 @@ class DAVIDConfig:
 
 @dataclass
 class DAVIDOutput:
-    recon: Tensor     # [B, N_queries, D] reconstructed features
-    mu: Tensor        # [B, L, D]
-    logvar: Tensor    # [B, L, D]
-    m: int            # truncation index used during this forward pass
+    recon: Tensor     # [B, N, D]
+    mu: Tensor        # [B, N, D]
+    logvar: Tensor    # [B, N, D]
+    m: int            # prefix length used
 
 
-class CrossAttentionBlock(nn.Module):
-    """Single block: cross-attention (queries → context) + self-attention + FFN."""
+def progressive_attn_mask(n: int, ratio: float, device) -> Tensor | None:
+    """Stochastic progressive attention mask (training only).
 
-    def __init__(self, dim: int, n_heads: int, dropout: float, ffn_dim: int):
+    Token i keeps ceil(N - i * ratio * (N-1)/N) random attention targets.
+      ratio=0.0: no masking
+      ratio=0.5: token N-1 sees ~N/2 random tokens
+      ratio=1.0: token N-1 sees ~1 random token
+
+    Returns [N, N] bool mask where True = ignore (PyTorch MHA convention), or None.
+    """
+    if ratio <= 0.0:
+        return None
+    idx = torch.arange(n, device=device, dtype=torch.float32)
+    # Number of tokens to DROP for each row
+    n_drop = (idx * ratio * (n - 1) / n).floor().long()  # [N], token 0 drops 0
+    # For each row, generate random scores and drop the lowest-scored ones
+    scores = torch.rand(n, n, device=device)  # [N, N]
+    # Rank positions per row (argsort of argsort = rank)
+    ranks = scores.argsort(dim=1).argsort(dim=1)  # [N, N], 0 = lowest score
+    # Mask positions with rank < n_drop[i]
+    return ranks < n_drop.unsqueeze(1)  # [N, N], True = ignore
+
+
+class SelfAttentionBlock(nn.Module):
+    """Self-attention + FFN with pre-norm residuals."""
+
+    def __init__(self, dim: int, n_heads: int, dropout: float, ffn_dim: int,
+                 progressive_ratio: float = 0.0):
         super().__init__()
-        self.cross_attn = nn.MultiheadAttention(dim, n_heads, dropout=dropout, batch_first=True)
-        self.self_attn = nn.MultiheadAttention(dim, n_heads, dropout=dropout, batch_first=True)
+        self.progressive_ratio = progressive_ratio
+        self.attn = nn.MultiheadAttention(dim, n_heads, dropout=dropout, batch_first=True)
         self.ffn = nn.Sequential(
             nn.Linear(dim, ffn_dim),
             nn.GELU(),
@@ -47,137 +69,78 @@ class CrossAttentionBlock(nn.Module):
         )
         self.norm1 = nn.LayerNorm(dim)
         self.norm2 = nn.LayerNorm(dim)
-        self.norm3 = nn.LayerNorm(dim)
 
-    def forward(
-        self,
-        queries: Tensor,          # [B, Q, D]
-        context: Tensor,          # [B, K, D]
-        key_padding_mask: Tensor | None = None,  # [B, K] True=ignore (PyTorch convention)
-    ) -> Tensor:
-        # Cross-attention: queries attend to context
-        x = queries
-        attn_out, _ = self.cross_attn(x, context, context, key_padding_mask=key_padding_mask)
-        x = self.norm1(x + attn_out)
-
-        # Self-attention among queries
-        attn_out, _ = self.self_attn(x, x, x)
-        x = self.norm2(x + attn_out)
-
-        # FFN
-        x = self.norm3(x + self.ffn(x))
+    def forward(self, x: Tensor, key_padding_mask: Tensor | None = None) -> Tensor:
+        if self.training and self.progressive_ratio > 0.0:
+            attn_mask = progressive_attn_mask(x.shape[1], self.progressive_ratio, x.device)
+        else:
+            attn_mask = None
+        h = self.norm1(x)
+        h, _ = self.attn(h, h, h, attn_mask=attn_mask, key_padding_mask=key_padding_mask)
+        x = x + h
+        x = x + self.ffn(self.norm2(x))
         return x
 
 
 class DAVIDEncoder(nn.Module):
-    """Transformer encoder that compresses N visual tokens into L latent tokens.
-
-    Uses cross-attention with L learned query vectors attending to the N input tokens.
-    Outputs mu and logvar for the VAE reparameterization.
-    """
+    """Self-attention with progressive masking: early tokens see all, late tokens see less."""
 
     def __init__(self, config: DAVIDConfig):
         super().__init__()
-        D = config.latent_dim
+        D = config.input_dim
         ffn_dim = D * config.ffn_multiplier
-
-        # L learned query vectors (broadcast over batch)
-        self.queries = nn.Parameter(torch.randn(1, config.L, D) * 0.02)
-
-        # Input projection in case input_dim != latent_dim
-        if config.input_dim != config.latent_dim:
-            self.input_proj = nn.Linear(config.input_dim, config.latent_dim)
-        else:
-            self.input_proj = nn.Identity()
-
         self.blocks = nn.ModuleList([
-            CrossAttentionBlock(D, config.n_heads, config.dropout, ffn_dim)
+            SelfAttentionBlock(D, config.n_heads, config.dropout, ffn_dim,
+                               progressive_ratio=config.progressive_ratio)
             for _ in range(config.n_encoder_layers)
         ])
-
-        # Project to 2*latent_dim for mu + logvar
         self.out_proj = nn.Linear(D, 2 * D)
 
-    def forward(self, features: Tensor, mask: Tensor) -> tuple[Tensor, Tensor]:
+    def forward(self, features: Tensor, mask: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         """
         Args:
-            features: [B, N, input_dim] — padded visual features.
-            mask:     [B, N] bool — True = valid token.
-
+            features: [B, N, D]
+            mask:     [B, N] True = valid
         Returns:
-            mu, logvar: each [B, L, latent_dim]
+            z, mu, logvar: each [B, N, D]
         """
-        B = features.shape[0]
-
-        context = self.input_proj(features)  # [B, N, D]
-        queries = self.queries.expand(B, -1, -1)  # [B, L, D]
-
-        # PyTorch MHA key_padding_mask: True means IGNORE that position
-        # Our mask is True=valid, so invert it
-        key_padding_mask = ~mask  # [B, N]
-
+        key_padding_mask = ~mask
+        x = features
         for block in self.blocks:
-            queries = block(queries, context, key_padding_mask=key_padding_mask)
+            x = block(x, key_padding_mask=key_padding_mask)
 
-        # Project to mu and logvar
-        out = self.out_proj(queries)  # [B, L, 2*D]
-        mu, logvar = out.chunk(2, dim=-1)  # each [B, L, D]
-
-        # Clamp logvar for numerical stability
+        out = self.out_proj(x)  # [B, N, 2*D]
+        mu, logvar = out.chunk(2, dim=-1)
         logvar = torch.clamp(logvar, -10.0, 4.0)
 
-        return mu, logvar
+        std = torch.exp(0.5 * logvar)
+        z = mu + std * torch.randn_like(std)
+        return z, mu, logvar
 
 
 class DAVIDDecoder(nn.Module):
-    """Transformer decoder that reconstructs N_queries tokens from m latent tokens.
-
-    Uses cross-attention with N_queries learned positional queries attending to
-    the (possibly truncated) latent prefix z[:, :m, :].
-    """
+    """Self-attention with progressive masking: reconstructs N tokens from zero-padded prefix."""
 
     def __init__(self, config: DAVIDConfig):
         super().__init__()
-        D = config.latent_dim
+        D = config.input_dim
         ffn_dim = D * config.ffn_multiplier
-
-        # N_queries learned positional query vectors
-        self.queries = nn.Parameter(torch.randn(1, config.N_queries, D) * 0.02)
-
         self.blocks = nn.ModuleList([
-            CrossAttentionBlock(D, config.n_heads, config.dropout, ffn_dim)
+            SelfAttentionBlock(D, config.n_heads, config.dropout, ffn_dim,
+                               progressive_ratio=config.progressive_ratio)
             for _ in range(config.n_decoder_layers)
         ])
+        self.out_proj = nn.Linear(D, D)
 
-        # Project back to input_dim (feature space)
-        self.out_proj = nn.Linear(D, config.input_dim)
-
-    def forward(self, z_prefix: Tensor) -> Tensor:
-        """
-        Args:
-            z_prefix: [B, m, latent_dim] — truncated latent prefix (m <= L).
-
-        Returns:
-            recon: [B, N_queries, input_dim] — reconstructed features.
-        """
-        B = z_prefix.shape[0]
-        queries = self.queries.expand(B, -1, -1)  # [B, N_queries, D]
-
-        # No key_padding_mask needed — all m latent tokens are valid
+    def forward(self, z_padded: Tensor) -> Tensor:
+        x = z_padded
         for block in self.blocks:
-            queries = block(queries, z_prefix, key_padding_mask=None)
-
-        recon = self.out_proj(queries)  # [B, N_queries, input_dim]
-        return recon
+            x = block(x)
+        return self.out_proj(x)
 
 
 class DAVIDVAE(nn.Module):
-    """Full DAVID VAE: encoder + reparameterization + stochastic prefix truncation + decoder.
-
-    During training, a random prefix length m is sampled each forward pass, forcing
-    the model to encode coarse information in early tokens and fine details in later ones.
-    At inference, all L tokens are used (or an arbitrary prefix for adaptive reasoning).
-    """
+    """Encoder → sample z → prefix truncate → zero-pad → decoder."""
 
     def __init__(self, config: DAVIDConfig):
         super().__init__()
@@ -185,50 +148,22 @@ class DAVIDVAE(nn.Module):
         self.encoder = DAVIDEncoder(config)
         self.decoder = DAVIDDecoder(config)
 
-    def reparameterize(self, mu: Tensor, logvar: Tensor) -> Tensor:
-        """Sample z ~ N(mu, exp(logvar)) using the reparameterization trick."""
-        std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(std)
-        return mu + eps * std
+    def forward(self, features: Tensor, mask: Tensor, training: bool = True) -> DAVIDOutput:
+        z, mu, logvar = self.encoder(features, mask)
 
-    def forward(
-        self,
-        features: Tensor,
-        mask: Tensor,
-        training: bool = True,
-    ) -> DAVIDOutput:
-        """
-        Args:
-            features: [B, N, D] — padded visual features from backbone.
-            mask:     [B, N] bool — True = valid token.
-            training: If True, apply stochastic prefix truncation.
+        N = z.shape[1]
+        m = torch.randint(1, N + 1, (1,)).item() if training else N
 
-        Returns:
-            DAVIDOutput with recon, mu, logvar, m.
-        """
-        # Encode
-        mu, logvar = self.encoder(features, mask)  # each [B, L, D]
+        z_padded = torch.zeros_like(z)
+        z_padded[:, :m, :] = z[:, :m, :]
 
-        # Reparameterize
-        z = self.reparameterize(mu, logvar)  # [B, L, D]
-
-        # Stochastic prefix truncation
-        L = self.config.L
-        if training:
-            m = torch.randint(1, L + 1, (1,)).item()
-        else:
-            m = L
-        z_prefix = z[:, :m, :]  # [B, m, D]
-
-        # Decode
-        recon = self.decoder(z_prefix)  # [B, N_queries, input_dim]
-
+        recon = self.decoder(z_padded)
         return DAVIDOutput(recon=recon, mu=mu, logvar=logvar, m=m)
 
-    def encode(self, features: Tensor, mask: Tensor) -> tuple[Tensor, Tensor]:
-        """Return mu, logvar without sampling."""
+    def encode(self, features: Tensor, mask: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         return self.encoder(features, mask)
 
-    def decode(self, z_prefix: Tensor) -> Tensor:
-        """Decode from a latent prefix of any length <= L."""
-        return self.decoder(z_prefix)
+    def decode(self, z_prefix: Tensor, n: int) -> Tensor:
+        z_padded = z_prefix.new_zeros(z_prefix.shape[0], n, z_prefix.shape[2])
+        z_padded[:, :z_prefix.shape[1], :] = z_prefix
+        return self.decoder(z_padded)
