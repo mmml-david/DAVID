@@ -10,9 +10,9 @@ model:
   grad_checkpoint: true     # recompute activations on backward pass to reduce activation memory
 
 training:
-  batch_size: 4
+  batch_size: 2
   gradient_accumulation_steps: 4
-  learning_rate: 1.0e-4
+  learning_rate: 3.0e-4
   weight_decay: 0.01
   max_steps: 100000
   warmup_steps: 1000
@@ -22,12 +22,14 @@ training:
   ema_decay: 0.999
 
 data:
-  dataset_name: "chancharikm/QualityCheck"
+  dataset_name: "/DATA/dataset/PerceptionTest"
   subset: "PerceptionTest"
-  feature_cache_dir: "/data/user_data/hsuanhal/11777/DAVID/2B_features_cache/perception_test"
+  feature_cache_dir: "/data/user_data/hsuanhal/11777/DAVID/features_cache/perception_test"
   sample_fps: 1.0         # sample 1 frame per second; videos vary in length so token count varies per video
   max_frames: 64          # safety cap to avoid OOM on unusually long videos
-  num_workers: 4
+  min_pixels: 16384       # 128*128 — minimum pixel budget for video frame resizing
+  max_pixels: 204800      # 320*640 — maximum pixel budget for video frame resizing
+  num_workers: 0
 
 extraction:
   dataset_name: "chancharikm/QualityCheck"
@@ -36,6 +38,8 @@ extraction:
   cache_dir: "/data/user_data/hsuanhal/11777/DAVID/2B_features_cache/perception_test"
   sample_fps: 1.0         # sample 1 frame per second
   max_frames: 64          # safety cap
+  min_pixels: 16384       # 128*128 — minimum pixel budget for video frame resizing
+  max_pixels: 204800      # 320*640 — maximum pixel budget for video frame resizing
   model_name: "Qwen/Qwen3-VL-2B-Instruct"
   device: "cuda"
   max_samples: -1         # -1 = all samples
@@ -48,6 +52,7 @@ logging:
   project: "DAVID"
   run_name: null  # set to a string to name the run, e.g. "baseline-lr1e4"; null = wandb auto-names it
   log_every: 50
-  eval_every: 1000
+  eval_every: 50
+  max_val_samples: 30
   save_every: 5000
   checkpoint_dir: "./checkpoints"

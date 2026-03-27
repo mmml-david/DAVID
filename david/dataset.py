@@ -7,7 +7,10 @@ Supports two modes:
 
 import os
 import io
+import logging
 import torch
+
+logging.getLogger("transformers.image_utils").setLevel(logging.ERROR)
 from torch import Tensor
 from torch.utils.data import Dataset
 from pathlib import Path
@@ -40,10 +43,14 @@ class PerceptionTestVideoDataset(Dataset):
         backbone=None,
         sample_fps: float = 1.0,
         max_frames: int = 64,
+        min_pixels: int | None = None,
+        max_pixels: int | None = None,
     ):
         self.mode = mode
         self.split = split
         self.sample_fps = sample_fps
+        self.min_pixels = min_pixels
+        self.max_pixels = max_pixels
 
         if mode == "cached":
             cache_path = Path(feature_cache_dir) / split
@@ -135,7 +142,7 @@ class PerceptionTestVideoDataset(Dataset):
                     {
                         "type": "video",
                         "video": frame_list,
-                        "fps": self.sample_fps,
+                        "nframes": len(frame_list),
                     },
                     {"type": "text", "text": "Describe the video."},
                 ],
@@ -147,12 +154,20 @@ class PerceptionTestVideoDataset(Dataset):
         if isinstance(video_kwargs.get("fps"), list) and len(video_kwargs["fps"]) == 1:
             video_kwargs["fps"] = video_kwargs["fps"][0]
 
-        inputs = self.processor(
+        processor_kwargs = dict(
             text=[text],
             videos=video_inputs,
             **video_kwargs,
             return_tensors="pt",
         )
+        if self.min_pixels is not None or self.max_pixels is not None:
+            vk = {}
+            if self.min_pixels is not None:
+                vk["min_pixels"] = self.min_pixels
+            if self.max_pixels is not None:
+                vk["max_pixels"] = self.max_pixels
+            processor_kwargs["videos_kwargs"] = vk
+        inputs = self.processor(**processor_kwargs)
 
         pixel_values = inputs["pixel_values_videos"]  # [total_patches, C*t*h*w]
         grid_thw = inputs["video_grid_thw"]           # [1, 3]

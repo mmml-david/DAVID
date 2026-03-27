@@ -57,17 +57,67 @@ def load_config(path: str) -> DotDict:
 
 # ─── Checkpoint helpers ───────────────────────────────────────────────────────
 
-def save_checkpoint(vae, optimizer, ema, step: int, loss: float, checkpoint_dir: str):
-    Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
-    path = Path(checkpoint_dir) / f"step_{step:07d}.pt"
-    torch.save({
+def _checkpoint_dict(vae, optimizer, ema, step: int, loss: float) -> dict:
+    return {
         "step": step,
         "loss": loss,
         "model_state_dict": vae.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "ema_state_dict": ema.state_dict() if ema is not None else None,
-    }, path)
+    }
+
+
+def save_checkpoint(vae, optimizer, ema, step: int, loss: float, checkpoint_dir: str,
+                    filename: str | None = None):
+    Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
+    path = Path(checkpoint_dir) / (filename or f"step_{step:07d}.pt")
+    torch.save(_checkpoint_dict(vae, optimizer, ema, step, loss), path)
     print(f"  [Checkpoint] Saved to {path}")
+
+
+def unpack_batch(batch, device):
+    """Extract features and mask from a batch, moving to device."""
+    if isinstance(batch, (list, tuple)):
+        return batch[0].to(device, dtype=torch.bfloat16), batch[1].to(device)
+    return batch["features"].to(device, dtype=torch.bfloat16), batch["mask"].to(device)
+
+
+@torch.no_grad()
+def validate(vae, val_loader, beta, device, max_batches: int = 0):
+    """Run over the validation set (up to max_batches if >0) and return average loss metrics."""
+    from david.loss import david_loss
+    vae.eval()
+    total_loss, total_mse, total_kl, n_batches = 0.0, 0.0, 0.0, 0
+    device_type = device.split(":")[0] if isinstance(device, str) else device.type
+    n_total = max_batches if max_batches > 0 else len(val_loader)
+    pbar = tqdm(val_loader, total=n_total, desc="Validating", leave=False)
+    for batch in pbar:
+        features, mask = unpack_batch(batch, device)
+        N = features.shape[1]
+        m = torch.randint(1, N + 1, (1,)).item()
+        with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+            output = vae(features, mask, training=True, m=m)
+            loss_out = david_loss(
+                recon=output.recon, target=features,
+                mu=output.mu, logvar=output.logvar,
+                beta=beta, m=output.m,
+            )
+        total_loss += loss_out.total.item()
+        total_mse += loss_out.mse
+        total_kl += loss_out.kl
+        n_batches += 1
+        pbar.set_postfix(mse=f"{total_mse/n_batches:.4f}", kl=f"{total_kl/n_batches:.4f}")
+        if max_batches > 0 and n_batches >= max_batches:
+            break
+    pbar.close()
+    vae.train()
+    if n_batches == 0:
+        return {"val/total": 0.0, "val/mse": 0.0, "val/kl": 0.0}
+    return {
+        "val/total": total_loss / n_batches,
+        "val/mse": total_mse / n_batches,
+        "val/kl": total_kl / n_batches,
+    }
 
 
 def load_checkpoint(vae, optimizer, ema, checkpoint_dir: str):
@@ -83,6 +133,29 @@ def load_checkpoint(vae, optimizer, ema, checkpoint_dir: str):
         ema.load_state_dict(state["ema_state_dict"])
     print(f"  [Checkpoint] Resumed from {latest} (step {state['step']})")
     return state["step"]
+
+
+def make_dataset(cfg, split, mode, backbone=None):
+    """Build a PerceptionTestVideoDataset for the given split and mode."""
+    from david.dataset import PerceptionTestVideoDataset
+    if mode == "online":
+        return PerceptionTestVideoDataset(
+            feature_cache_dir=cfg.data.feature_cache_dir,
+            split=split,
+            mode="online",
+            hf_dataset_name=cfg.data.dataset_name,
+            subset=cfg.data.subset,
+            backbone=backbone,
+            sample_fps=cfg.data.sample_fps,
+            max_frames=cfg.data.max_frames,
+            min_pixels=getattr(cfg.data, 'min_pixels', None),
+            max_pixels=getattr(cfg.data, 'max_pixels', None),
+        )
+    return PerceptionTestVideoDataset(
+        feature_cache_dir=cfg.data.feature_cache_dir,
+        split=split,
+        mode="cached",
+    )
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
@@ -179,22 +252,10 @@ def main():
             device=device,
             dtype=torch.bfloat16,
         )
-        dataset = PerceptionTestVideoDataset(
-            feature_cache_dir=cfg.data.feature_cache_dir,
-            split="train",
-            mode="online",
-            hf_dataset_name=cfg.data.dataset_name,
-            subset=cfg.data.subset,
-            backbone=backbone,
-            sample_fps=cfg.data.sample_fps,
-            max_frames=cfg.data.max_frames,
-        )
+        dataset = make_dataset(cfg, "train", "online", backbone)
     else:
-        dataset = PerceptionTestVideoDataset(
-            feature_cache_dir=cfg.data.feature_cache_dir,
-            split="train",
-            mode="cached",
-        )
+        backbone = None
+        dataset = make_dataset(cfg, "train", "cached")
     dbg(f"Dataset ready: size={len(dataset)}")
 
     num_workers = 0 if args.smoke_test else cfg.data.num_workers
@@ -230,6 +291,27 @@ def main():
         f"mp_ctx={'spawn' if str(device).startswith('cuda') and num_workers > 0 else 'default'}"
     )
 
+    # ── Validation dataset ──
+    val_loader = None
+    if not args.smoke_test:
+        val_split = getattr(cfg.data, 'val_split', 'validation')
+        mode = "online" if args.online else "cached"
+        try:
+            val_dataset = make_dataset(cfg, val_split, mode, backbone)
+            val_loader = DataLoader(
+                val_dataset,
+                batch_size=cfg.training.batch_size,
+                shuffle=False,
+                collate_fn=PerceptionTestVideoDataset.collate_fn,
+                num_workers=0 if args.online else num_workers,
+                pin_memory=(str(device).startswith("cuda")),
+            )
+            if is_main:
+                print(f"Validation set: {len(val_dataset)} samples (split='{val_split}')")
+        except (FileNotFoundError, ValueError) as e:
+            if is_main:
+                print(f"[Warn] No validation set available ({e}); skipping eval.")
+
     # ── WandB (main process only) ──
     use_wandb = cfg.logging.use_wandb and not args.smoke_test and is_main
     if use_wandb:
@@ -254,6 +336,10 @@ def main():
     # ── Training loop ──
     max_steps = 2 if args.smoke_test else cfg.training.max_steps
     grad_accum = cfg.training.gradient_accumulation_steps
+
+    max_val_samples = getattr(cfg.logging, 'max_val_samples', 0)
+    max_val_batches = (max_val_samples + cfg.training.batch_size - 1) // cfg.training.batch_size if max_val_samples > 0 else 0
+    best_val_loss = float("inf")
 
     step = start_step
     optimizer.zero_grad()
@@ -282,11 +368,7 @@ def main():
                 break
             dbg("Batch fetched")
 
-            if isinstance(batch, (list, tuple)):
-                features, mask = batch[0].to(device, dtype=torch.bfloat16), batch[1].to(device)
-            else:
-                features = batch["features"].to(device, dtype=torch.bfloat16)
-                mask = batch["mask"].to(device)
+            features, mask = unpack_batch(batch, device)
             feature_dim = features.shape[-1]
             if feature_dim != david_cfg.input_dim:
                 raise ValueError(
@@ -358,6 +440,18 @@ def main():
 
                 if args.smoke_test:
                     print(f"\n[Smoke test] Step {step}: {metrics}")
+
+            # Validation (main process only)
+            if is_main and val_loader is not None and step > 0 and step % cfg.logging.eval_every == 0:
+                val_metrics = validate(vae, val_loader, beta, device, max_batches=max_val_batches)
+                if use_wandb:
+                    wandb.log(val_metrics, step=step)
+                print(f"  [Val] step {step}: {val_metrics}")
+                if val_metrics["val/total"] < best_val_loss:
+                    best_val_loss = val_metrics["val/total"]
+                    save_checkpoint(raw_vae, optimizer, ema, step, best_val_loss,
+                                    cfg.logging.checkpoint_dir, filename="best.pt")
+                    print(f"  [Best] val_loss={best_val_loss:.6f}")
 
             # Checkpointing (main process only)
             if is_main and not args.smoke_test and step > 0 and step % cfg.logging.save_every == 0:
