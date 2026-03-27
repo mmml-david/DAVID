@@ -1,22 +1,30 @@
 """Loss functions and beta scheduler for DAVID VAE training."""
 
 import torch
-import torch.nn.functional as F
 from torch import Tensor
 from dataclasses import dataclass
 
 
-def reconstruction_loss(recon: Tensor, target: Tensor) -> Tensor:
-    """Mean squared error between reconstructed and target features.
+def reconstruction_loss(recon: Tensor, target: Tensor, m: int, N: int) -> Tensor:
+    """Adaptive reconstruction loss that scales with prefix length m.
+
+    Exponent p = 2 * sigmoid(m/N) smoothly transitions from ~1 (L1) to ~2 (L2).
+    Scale s = 2 * sigmoid(m/N) weights the loss: low when m is small, high when m is large.
 
     Args:
-        recon:  [batch, N_queries, D] — decoder output.
-        target: [batch, N_queries, D] — interpolated backbone features.
+        recon:  [batch, N, D] — decoder output.
+        target: [batch, N, D] — original backbone features.
+        m:      prefix length used in this forward pass.
+        N:      full sequence length.
 
     Returns:
-        Scalar MSE loss.
+        Scalar reconstruction loss.
     """
-    return F.mse_loss(recon, target)
+    t = torch.sigmoid(torch.tensor(float(m) / N, device=recon.device))
+    p = 2.0 * t      # exponent: ~1 → ~2
+    scale = 2.0 * t   # weight:   ~1 → ~2
+
+    return scale * (recon - target).abs().pow(p).mean()
 
 
 def kl_loss(mu: Tensor, logvar: Tensor) -> Tensor:
@@ -25,11 +33,11 @@ def kl_loss(mu: Tensor, logvar: Tensor) -> Tensor:
     KL = -0.5 * sum(1 + logvar - mu^2 - exp(logvar))
 
     Args:
-        mu:     [batch, L, D]
-        logvar: [batch, L, D]
+        mu:     [batch, N, D]
+        logvar: [batch, N, D]
 
     Returns:
-        Scalar KL loss (mean over batch, L, D).
+        Scalar KL loss (mean over batch, N, D).
     """
     return -0.5 * (1.0 + logvar - mu.pow(2) - logvar.exp()).mean()
 
@@ -51,23 +59,24 @@ def david_loss(
     beta: float,
     m: int,
 ) -> LossOutput:
-    """Combined DAVID VAE loss: MSE + beta * KL.
+    """Combined DAVID VAE loss: adaptive recon + beta * KL.
 
     Args:
-        recon:  [B, N_queries, D]
-        target: [B, N_queries, D]
-        mu:     [B, L, D]
-        logvar: [B, L, D]
-        beta:   KL weight (annealed from 0 during training)
-        m:      Truncation index (for logging)
+        recon:  [B, N, D]
+        target: [B, N, D]
+        mu:     [B, N, D]
+        logvar: [B, N, D]
+        beta:   KL weight (keep small, annealed from 0 during training)
+        m:      Truncation prefix length
 
     Returns:
         LossOutput with total loss tensor and scalar metrics.
     """
-    mse = reconstruction_loss(recon, target)
+    N = recon.shape[1]
+    recon_loss = reconstruction_loss(recon, target, m, N)
     kl = kl_loss(mu, logvar)
-    total = mse + beta * kl
-    return LossOutput(total=total, mse=mse.item(), kl=kl.item(), beta=beta, m=m)
+    total = recon_loss + beta * kl
+    return LossOutput(total=total, mse=recon_loss.item(), kl=kl.item(), beta=beta, m=m)
 
 
 class BetaScheduler:
