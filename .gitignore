@@ -1,4 +1,5 @@
 /*.sh
+.env
 features_cache/
 checkpoints/
 wandb/
