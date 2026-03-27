@@ -7,9 +7,10 @@ model:
   n_heads: 16
   dropout: 0.1
   progressive_ratio: 0.0    # 0.0 = no mask, 0.5 = token N-1 sees ~N/2 random, 1.0 = sees ~1 random
+  grad_checkpoint: true     # recompute activations on backward pass to reduce activation memory
 
 training:
-  batch_size: 8
+  batch_size: 4
   gradient_accumulation_steps: 4
   learning_rate: 1.0e-4
   weight_decay: 0.01
