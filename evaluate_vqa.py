@@ -47,6 +47,156 @@ class EvalSample:
     video: Any
 
 
+@dataclass
+class VQASample:
+    """A single VQA question loaded from a JSON file."""
+    sample_id: str
+    video_name: str
+    video_path: str
+    question: str
+    options: list[str]
+    answer_index: int
+    split_name: str
+    prompt: str  # formatted question + options ready for the model
+
+
+def match_mcq_response(response: str, answer_index: int, options: list[str]) -> bool:
+    """Check if a model response matches the correct answer.
+
+    Handles:
+      - Response starts with the correct letter: "C" or "C. moving"
+      - Response contains the correct letter standalone: "The answer is C"
+      - Response contains the correct option text: "The answer is: yes, it's a static."
+    """
+    import re
+
+    if not response or answer_index < 0 or answer_index >= len(options):
+        return False
+
+    response_clean = response.strip()
+    response_upper = response_clean.upper()
+    option_labels = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    correct_letter = option_labels[answer_index]
+    correct_text = options[answer_index].strip().lower()
+
+    # 1. Response starts with the correct letter (e.g. "C", "C.", "C. moving")
+    if response_upper.startswith(correct_letter):
+        # Make sure it's the letter alone, not a word starting with that letter
+        if len(response_clean) == 1 or not response_clean[1].isalpha():
+            return True
+
+    # 2. Response contains the correct letter as a standalone token
+    #    e.g. "The answer is C" or "Answer: B"
+    if re.search(rf'\b{correct_letter}\b', response_upper):
+        # Make sure no OTHER option letter also appears standalone (ambiguous)
+        other_letters = [option_labels[i] for i in range(len(options)) if i != answer_index]
+        if not any(re.search(rf'\b{ltr}\b', response_upper) for ltr in other_letters):
+            return True
+
+    # 3. Response contains the correct option text (fuzzy text match)
+    #    e.g. "The answer is: yes, it's a static." matching option "static or shaking"
+    response_lower = response_clean.lower()
+    if correct_text and correct_text in response_lower:
+        return True
+
+    # 4. Check if the correct option text is the best match among all options
+    #    (the response contains the correct option text but not other options)
+    matches = [i for i, opt in enumerate(options) if opt.strip().lower() in response_lower]
+    if len(matches) == 1 and matches[0] == answer_index:
+        return True
+
+    return False
+
+
+def build_mcq_prompt(question: str, options: list[str]) -> str:
+    """Format a multiple-choice question into a prompt string."""
+    option_labels = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    lines = [question]
+    for i, opt in enumerate(options):
+        label = option_labels[i] if i < len(option_labels) else str(i)
+        lines.append(f"{label}. {opt}")
+    lines.append("Answer with the letter of the correct option.")
+    return "\n".join(lines)
+
+
+def resolve_video_url_to_local(video_url: str, cache_root: str) -> str | None:
+    """Resolve a HuggingFace video URL to a local cache path.
+
+    Looks up the file under the HF hub cache directory structure:
+      <cache_root>/datasets--<owner>--<repo>/snapshots/<hash>/<path_in_repo>
+    """
+    import re
+
+    m = re.match(
+        r"https://huggingface\.co/datasets/([^/]+)/([^/]+)/resolve/[^/]+/(.+)",
+        video_url,
+    )
+    if m is None:
+        return None
+    owner, repo, path_in_repo = m.group(1), m.group(2), m.group(3)
+
+    dataset_dir = os.path.join(cache_root, f"datasets--{owner}--{repo}")
+    snapshots_dir = os.path.join(dataset_dir, "snapshots")
+    if not os.path.isdir(snapshots_dir):
+        return None
+
+    # Check each snapshot revision for the file
+    for revision in os.listdir(snapshots_dir):
+        candidate = os.path.join(snapshots_dir, revision, path_in_repo)
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def load_vqa_samples_from_json(
+    json_path: str,
+    max_samples: int,
+    cache_root: str,
+) -> list[VQASample]:
+    """Load valid-set VQA samples from a JSON file and resolve video paths."""
+    with open(json_path) as f:
+        data = json.load(f)
+
+    # Filter to valid set only (video_url contains /valid/)
+    valid_entries = [e for e in data if "/valid/" in e.get("video_url", "")]
+
+    samples: list[VQASample] = []
+    skipped = 0
+    for entry in valid_entries:
+        video_url = entry["video_url"]
+        # Extract video name from URL
+        video_name = os.path.splitext(os.path.basename(video_url))[0]
+
+        # Resolve to local path
+        local_path = resolve_video_url_to_local(video_url, cache_root)
+        if local_path is None or not os.path.exists(local_path):
+            skipped += 1
+            continue
+
+        question = entry.get("question", "")
+        options = entry.get("option", [])
+        answer_index = entry.get("answer", -1)
+        prompt = build_mcq_prompt(question, options)
+
+        samples.append(VQASample(
+            sample_id=entry.get("sample_id", ""),
+            video_name=video_name,
+            video_path=local_path,
+            question=question,
+            options=options,
+            answer_index=answer_index,
+            split_name=entry.get("split_name", ""),
+            prompt=prompt,
+        ))
+
+        if 0 < max_samples <= len(samples):
+            break
+
+    if skipped:
+        print(f"Warning: skipped {skipped} entries whose videos were not found locally")
+    return samples
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate VQA-style prompting on PerceptionTest videos")
 
@@ -70,6 +220,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--streaming", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--dedupe_videos", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--max_samples", type=int, default=100)
+    parser.add_argument(
+        "--questions_json",
+        default=None,
+        help="Path to a JSON file with per-sample VQA questions (e.g. perception_test.json). "
+             "When provided, only valid-set entries are used and each sample's question+options "
+             "become the prompt. Overrides --prompt, --split, --dataset_name, etc.",
+    )
+    parser.add_argument(
+        "--hf_cache_root",
+        default="/DATA/huggingface/hub",
+        help="Root directory of the HuggingFace hub cache where dataset blobs/snapshots live.",
+    )
 
     # Video / prompt args
     parser.add_argument("--sample_fps", type=float, default=1.0)
@@ -83,6 +245,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top_p", type=float, default=0.9)
 
     # DAVID args
+    parser.add_argument("--vae_device", default="auto", help="'auto' (same as model), 'cpu', or 'cuda:X'")
     parser.add_argument("--vae_config", default="configs/train_config.yaml")
     parser.add_argument("--vae_checkpoint", default=None)
     parser.add_argument("--vae_use_mu", action=argparse.BooleanOptionalAction, default=True)
@@ -409,11 +572,15 @@ class DavidVideoFeatureAdapter:
     def __enter__(self):
         self._orig_get_video_features = self._target.get_video_features
 
-        def patched_get_video_features(this, pixel_values_videos, video_grid_thw):
-            video_embeds, deepstack_video_embeds = self._orig_get_video_features(pixel_values_videos, video_grid_thw)
+        def patched_get_video_features(this, pixel_values_videos, video_grid_thw, **kwargs):
+            video_outputs = self._orig_get_video_features(pixel_values_videos, video_grid_thw, **kwargs)
+            video_embeds = video_outputs.pooler_output
+            deepstack_video_embeds = video_outputs.deepstack_features
             recon_video_embeds = self._reconstruct_video_features(video_embeds)
             adapted_deepstack = self._adapt_deepstack(deepstack_video_embeds, recon_video_embeds)
-            return recon_video_embeds, adapted_deepstack
+            video_outputs.pooler_output = recon_video_embeds
+            video_outputs.deepstack_features = adapted_deepstack
+            return video_outputs
 
         self._target.get_video_features = types.MethodType(patched_get_video_features, self._target)
         return self
@@ -449,7 +616,7 @@ def run_generation(
 
 def make_record(
     method: str,
-    sample: EvalSample,
+    sample: EvalSample | VQASample,
     prompt: str,
     response: str | None,
     error: str | None,
@@ -457,11 +624,9 @@ def make_record(
     n_frames: int | None,
     elapsed_sec: float,
 ) -> dict[str, Any]:
-    return {
+    rec: dict[str, Any] = {
         "method": method,
-        "row_index": sample.row_index,
-        "video_name": sample.video_name,
-        "label": sample.label,
+        "video_name": sample.video_name if isinstance(sample, VQASample) else sample.video_name,
         "prompt": prompt,
         "response": response,
         "error": error,
@@ -469,6 +634,19 @@ def make_record(
         "num_sampled_frames": n_frames,
         "elapsed_sec": elapsed_sec,
     }
+    if isinstance(sample, VQASample):
+        rec["sample_id"] = sample.sample_id
+        rec["split_name"] = sample.split_name
+        rec["question"] = sample.question
+        rec["options"] = sample.options
+        rec["answer_index"] = sample.answer_index
+        option_labels = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        rec["answer_letter"] = option_labels[sample.answer_index] if 0 <= sample.answer_index < len(option_labels) else None
+        rec["matched"] = match_mcq_response(response or "", sample.answer_index, sample.options)
+    else:
+        rec["row_index"] = sample.row_index
+        rec["label"] = sample.label
+    return rec
 
 
 def main() -> None:
@@ -476,7 +654,7 @@ def main() -> None:
     methods = choose_methods(args.method)
 
     if args.method in {"david", "both"} and not args.vae_checkpoint:
-        raise ValueError("--vae_checkpoint is required when --method is 'david' or 'both'.")
+        print("Warning: no --vae_checkpoint provided, using randomly initialized VAE")
 
     if args.vae_prefix_tokens is not None and args.vae_prefix_ratio is not None:
         raise ValueError("Use only one of --vae_prefix_tokens or --vae_prefix_ratio.")
@@ -509,9 +687,16 @@ def main() -> None:
     vae = None
     david_adapter = None
     if "david" in methods:
-        vae_device = torch.device(model_device)
-        print(f"Loading DAVID VAE checkpoint: {args.vae_checkpoint}")
-        vae = load_vae(args.vae_config, args.vae_checkpoint, vae_device)
+        vae_device = torch.device("cpu") if args.vae_device == "cpu" else torch.device(model_device)
+        if args.vae_checkpoint:
+            print(f"Loading DAVID VAE checkpoint: {args.vae_checkpoint} (device: {vae_device})")
+            vae = load_vae(args.vae_config, args.vae_checkpoint, vae_device)
+        else:
+            print(f"Initializing random VAE on {vae_device}")
+            with open(args.vae_config) as f:
+                cfg = yaml.safe_load(f)
+            vae = DAVIDVAE(DAVIDConfig.from_dict(dict(cfg.get("model", {})))).to(vae_device)
+            vae.eval()
         david_adapter = DavidVideoFeatureAdapter(
             qwen_model=model,
             vae=vae,
@@ -529,105 +714,201 @@ def main() -> None:
 
     records: list[dict[str, Any]] = []
 
-    print(
-        f"Running evaluation: methods={methods}, split={args.split}, "
-        f"streaming={args.streaming}, max_samples={args.max_samples}"
-    )
+    use_json = args.questions_json is not None
 
-    samples = iter_eval_samples(
-        dataset_name=args.dataset_name,
-        subset=args.subset,
-        split=args.split,
-        streaming=args.streaming,
-        dedupe_videos=args.dedupe_videos,
-        max_samples=args.max_samples,
-    )
+    if use_json:
+        # ── JSON-based VQA evaluation (valid set) ──
+        print(f"Loading VQA questions from: {args.questions_json}")
+        vqa_samples = load_vqa_samples_from_json(args.questions_json, args.max_samples, args.hf_cache_root)
+        print(f"Loaded {len(vqa_samples)} valid-set VQA samples")
 
-    progress = tqdm(samples, total=args.max_samples if args.max_samples > 0 else None, desc="Evaluating")
+        split_label = "valid"
+        jsonl_path = out_dir / f"perceptiontest_{split_label}_{args.method}_{timestamp}.jsonl"
+        summary_path = out_dir / f"perceptiontest_{split_label}_{args.method}_{timestamp}_summary.json"
 
-    for sample in progress:
-        try:
-            frames, video_fps = decode_video_frames(
-                sample.video,
-                sample_fps=args.sample_fps,
-                max_frames=args.max_frames,
-            )
+        # Cache decoded frames per video to avoid re-decoding for multiple questions
+        frame_cache: dict[str, tuple[list[Image.Image], float]] = {}
 
-            inputs = build_qwen_inputs(
-                processor=processor,
-                frame_list=frames,
-                prompt=args.prompt,
-                sample_fps=args.sample_fps,
-                device=model_device,
-            )
+        progress = tqdm(vqa_samples, desc="Evaluating VQA")
+        for vqa_sample in progress:
+            prompt = vqa_sample.prompt
 
-            for method in methods:
-                t0 = datetime.now()
-                response = None
-                error = None
+            try:
+                if vqa_sample.video_path not in frame_cache:
+                    frames, video_fps = decode_video_frames(
+                        vqa_sample.video_path,
+                        sample_fps=args.sample_fps,
+                        max_frames=args.max_frames,
+                    )
+                    frame_cache[vqa_sample.video_path] = (frames, video_fps)
+                frames, video_fps = frame_cache[vqa_sample.video_path]
 
-                try:
-                    ctx = nullcontext() if method == "qwen" else david_adapter
-                    with ctx:
-                        response = run_generation(
-                            model=model,
-                            processor=processor,
-                            inputs=inputs,
-                            max_new_tokens=args.max_new_tokens,
-                            do_sample=args.do_sample,
-                            temperature=args.temperature,
-                            top_p=args.top_p,
+                inputs = build_qwen_inputs(
+                    processor=processor,
+                    frame_list=frames,
+                    prompt=prompt,
+                    sample_fps=args.sample_fps,
+                    device=model_device,
+                )
+
+                for method in methods:
+                    t0 = datetime.now()
+                    response = None
+                    error = None
+
+                    try:
+                        ctx = nullcontext() if method == "qwen" else david_adapter
+                        with ctx:
+                            response = run_generation(
+                                model=model,
+                                processor=processor,
+                                inputs=inputs,
+                                max_new_tokens=args.max_new_tokens,
+                                do_sample=args.do_sample,
+                                temperature=args.temperature,
+                                top_p=args.top_p,
+                            )
+                    except Exception as e:
+                        import traceback
+                        traceback.print_exc()
+                        error = f"{type(e).__name__}: {e}"
+
+                    elapsed_sec = (datetime.now() - t0).total_seconds()
+                    records.append(
+                        make_record(
+                            method=method,
+                            sample=vqa_sample,
+                            prompt=prompt,
+                            response=response,
+                            error=error,
+                            video_fps=video_fps,
+                            n_frames=len(frames),
+                            elapsed_sec=elapsed_sec,
                         )
-                except Exception as e:  # pragma: no cover - runtime environment dependent
-                    import traceback
-                    traceback.print_exc()
-                    error = f"{type(e).__name__}: {e}"
-
-                elapsed_sec = (datetime.now() - t0).total_seconds()
-                records.append(
-                    make_record(
-                        method=method,
-                        sample=sample,
-                        prompt=args.prompt,
-                        response=response,
-                        error=error,
-                        video_fps=video_fps,
-                        n_frames=len(frames),
-                        elapsed_sec=elapsed_sec,
                     )
+
+            except Exception as e:
+                err = f"{type(e).__name__}: {e}"
+                for method in methods:
+                    records.append(
+                        make_record(
+                            method=method,
+                            sample=vqa_sample,
+                            prompt=prompt,
+                            response=None,
+                            error=err,
+                            video_fps=None,
+                            n_frames=None,
+                            elapsed_sec=0.0,
+                        )
+                    )
+
+    else:
+        # ── Original HF-dataset-based evaluation ──
+        jsonl_path = out_dir / f"perceptiontest_{args.split}_{args.method}_{timestamp}.jsonl"
+        summary_path = out_dir / f"perceptiontest_{args.split}_{args.method}_{timestamp}_summary.json"
+
+        print(
+            f"Running evaluation: methods={methods}, split={args.split}, "
+            f"streaming={args.streaming}, max_samples={args.max_samples}"
+        )
+
+        samples = iter_eval_samples(
+            dataset_name=args.dataset_name,
+            subset=args.subset,
+            split=args.split,
+            streaming=args.streaming,
+            dedupe_videos=args.dedupe_videos,
+            max_samples=args.max_samples,
+        )
+
+        progress = tqdm(samples, total=args.max_samples if args.max_samples > 0 else None, desc="Evaluating")
+
+        for sample in progress:
+            try:
+                frames, video_fps = decode_video_frames(
+                    sample.video,
+                    sample_fps=args.sample_fps,
+                    max_frames=args.max_frames,
                 )
 
-        except Exception as e:  # pragma: no cover - runtime environment dependent
-            err = f"{type(e).__name__}: {e}"
-            for method in methods:
-                records.append(
-                    make_record(
-                        method=method,
-                        sample=sample,
-                        prompt=args.prompt,
-                        response=None,
-                        error=err,
-                        video_fps=None,
-                        n_frames=None,
-                        elapsed_sec=0.0,
-                    )
+                inputs = build_qwen_inputs(
+                    processor=processor,
+                    frame_list=frames,
+                    prompt=args.prompt,
+                    sample_fps=args.sample_fps,
+                    device=model_device,
                 )
 
+                for method in methods:
+                    t0 = datetime.now()
+                    response = None
+                    error = None
+
+                    try:
+                        ctx = nullcontext() if method == "qwen" else david_adapter
+                        with ctx:
+                            response = run_generation(
+                                model=model,
+                                processor=processor,
+                                inputs=inputs,
+                                max_new_tokens=args.max_new_tokens,
+                                do_sample=args.do_sample,
+                                temperature=args.temperature,
+                                top_p=args.top_p,
+                            )
+                    except Exception as e:
+                        import traceback
+                        traceback.print_exc()
+                        error = f"{type(e).__name__}: {e}"
+
+                    elapsed_sec = (datetime.now() - t0).total_seconds()
+                    records.append(
+                        make_record(
+                            method=method,
+                            sample=sample,
+                            prompt=args.prompt,
+                            response=response,
+                            error=error,
+                            video_fps=video_fps,
+                            n_frames=len(frames),
+                            elapsed_sec=elapsed_sec,
+                        )
+                    )
+
+            except Exception as e:
+                err = f"{type(e).__name__}: {e}"
+                for method in methods:
+                    records.append(
+                        make_record(
+                            method=method,
+                            sample=sample,
+                            prompt=args.prompt,
+                            response=None,
+                            error=err,
+                            video_fps=None,
+                            n_frames=None,
+                            elapsed_sec=0.0,
+                        )
+                    )
+
+    # ── Write outputs ──
     with open(jsonl_path, "w", encoding="utf-8") as f:
         for rec in records:
             f.write(json.dumps(rec, ensure_ascii=True) + "\n")
 
     summary: dict[str, Any] = {
         "timestamp": timestamp,
+        "questions_json": args.questions_json,
         "dataset": {
             "dataset_name": args.dataset_name,
             "subset": args.subset,
-            "split": args.split,
+            "split": "valid" if use_json else args.split,
             "streaming": args.streaming,
             "dedupe_videos": args.dedupe_videos,
             "max_samples": args.max_samples,
         },
-        "prompt": args.prompt,
+        "prompt": "per-sample MCQ" if use_json else args.prompt,
         "methods": methods,
         "n_records": len(records),
         "n_errors": sum(1 for r in records if r["error"] is not None),
@@ -636,18 +917,23 @@ def main() -> None:
         },
     }
 
-    # Per-method quick stats
+    # Per-method quick stats (with accuracy for JSON mode)
     method_stats: dict[str, dict[str, Any]] = {}
     for method in methods:
         method_rows = [r for r in records if r["method"] == method]
         ok_rows = [r for r in method_rows if r["error"] is None]
         avg_latency = sum(r["elapsed_sec"] for r in ok_rows) / len(ok_rows) if ok_rows else None
-        method_stats[method] = {
+        stats: dict[str, Any] = {
             "n_records": len(method_rows),
             "n_ok": len(ok_rows),
             "n_errors": len(method_rows) - len(ok_rows),
             "avg_elapsed_sec": avg_latency,
         }
+        if use_json and ok_rows:
+            correct = sum(1 for r in ok_rows if r.get("matched"))
+            stats["n_correct"] = correct
+            stats["accuracy"] = correct / len(ok_rows)
+        method_stats[method] = stats
 
     summary["method_stats"] = method_stats
 
@@ -656,6 +942,10 @@ def main() -> None:
 
     print(f"Saved predictions: {jsonl_path}")
     print(f"Saved summary: {summary_path}")
+    if use_json:
+        for method, stats in method_stats.items():
+            if "accuracy" in stats:
+                print(f"  {method} accuracy: {stats['accuracy']:.2%} ({stats['n_correct']}/{stats['n_ok']})")
 
 
 if __name__ == "__main__":

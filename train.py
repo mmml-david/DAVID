@@ -87,7 +87,7 @@ def validate(vae, val_loader, beta, device, max_batches: int = 0):
     """Run over the validation set (up to max_batches if >0) and return average loss metrics."""
     from david.loss import david_loss
     vae.eval()
-    total_loss, total_mse, total_kl, n_batches = 0.0, 0.0, 0.0, 0
+    total_mse, n_batches = 0.0, 0
     device_type = device.split(":")[0] if isinstance(device, str) else device.type
     n_total = max_batches if max_batches > 0 else len(val_loader)
     pbar = tqdm(val_loader, total=n_total, desc="Validating", leave=False)
@@ -102,22 +102,16 @@ def validate(vae, val_loader, beta, device, max_batches: int = 0):
                 mu=output.mu, logvar=output.logvar,
                 beta=beta, m=output.m,
             )
-        total_loss += loss_out.total.item()
         total_mse += loss_out.mse
-        total_kl += loss_out.kl
         n_batches += 1
-        pbar.set_postfix(mse=f"{total_mse/n_batches:.4f}", kl=f"{total_kl/n_batches:.4f}")
+        pbar.set_postfix(mse=f"{total_mse/n_batches:.4f}")
         if max_batches > 0 and n_batches >= max_batches:
             break
     pbar.close()
     vae.train()
     if n_batches == 0:
-        return {"val/total": 0.0, "val/mse": 0.0, "val/kl": 0.0}
-    return {
-        "val/total": total_loss / n_batches,
-        "val/mse": total_mse / n_batches,
-        "val/kl": total_kl / n_batches,
-    }
+        return {"val/mse": 0.0}
+    return {"val/mse": total_mse / n_batches}
 
 
 def load_checkpoint(vae, optimizer, ema, checkpoint_dir: str):
@@ -446,12 +440,14 @@ def main():
                 val_metrics = validate(vae, val_loader, beta, device, max_batches=max_val_batches)
                 if use_wandb:
                     wandb.log(val_metrics, step=step)
-                print(f"  [Val] step {step}: {val_metrics}")
-                if val_metrics["val/total"] < best_val_loss:
-                    best_val_loss = val_metrics["val/total"]
+                print(f"  [Val] step {step}: mse={val_metrics['val/mse']:.6f}")
+                if val_metrics["val/mse"] < best_val_loss:
+                    best_val_loss = val_metrics["val/mse"]
+                    save_checkpoint(raw_vae, optimizer, ema, step, best_val_loss,
+                                    cfg.logging.checkpoint_dir)
                     save_checkpoint(raw_vae, optimizer, ema, step, best_val_loss,
                                     cfg.logging.checkpoint_dir, filename="best.pt")
-                    print(f"  [Best] val_loss={best_val_loss:.6f}")
+                    print(f"  [Best] val_mse={best_val_loss:.6f}")
 
             # Checkpointing (main process only)
             if is_main and not args.smoke_test and step > 0 and step % cfg.logging.save_every == 0:
