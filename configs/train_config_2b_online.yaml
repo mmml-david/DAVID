@@ -52,6 +52,7 @@ logging:
   project: "DAVID"
   run_name: null  # set to a string to name the run, e.g. "baseline-lr1e4"; null = wandb auto-names it
   log_every: 50
-  eval_every: 1000
+  eval_every: 50
+  max_val_samples: 30
   save_every: 5000
   checkpoint_dir: "./checkpoints"
