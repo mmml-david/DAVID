@@ -7,7 +7,10 @@ Supports two modes:
 
 import os
 import io
+import logging
 import torch
+
+logging.getLogger("transformers.image_utils").setLevel(logging.ERROR)
 from torch import Tensor
 from torch.utils.data import Dataset
 from pathlib import Path
@@ -135,7 +138,7 @@ class PerceptionTestVideoDataset(Dataset):
                     {
                         "type": "video",
                         "video": frame_list,
-                        "fps": self.sample_fps,
+                        "nframes": len(frame_list),
                     },
                     {"type": "text", "text": "Describe the video."},
                 ],
@@ -152,6 +155,7 @@ class PerceptionTestVideoDataset(Dataset):
             videos=video_inputs,
             **video_kwargs,
             return_tensors="pt",
+            videos_kwargs={"min_pixels": 128 * 128, "max_pixels": 320 * 640},
         )
 
         pixel_values = inputs["pixel_values_videos"]  # [total_patches, C*t*h*w]
