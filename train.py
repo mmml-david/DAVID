@@ -13,6 +13,7 @@ Usage:
 
 import argparse
 import os
+import multiprocessing as mp
 from pathlib import Path
 
 import torch
@@ -160,16 +161,35 @@ def main():
         )
     dbg(f"Dataset ready: size={len(dataset)}")
 
+    num_workers = 0 if args.smoke_test else cfg.data.num_workers
+    if args.online and num_workers > 0:
+        print(
+            "[DataLoader] online mode runs CUDA feature extraction inside __getitem__; "
+            "forcing num_workers=0 to avoid CUDA-in-subprocess errors."
+        )
+        num_workers = 0
+
+    loader_kwargs = {
+        "batch_size": cfg.training.batch_size,
+        "shuffle": True,
+        "collate_fn": None if args.smoke_test else PerceptionTestVideoDataset.collate_fn,
+        "num_workers": num_workers,
+        "pin_memory": (device == "cuda"),
+        "drop_last": True,
+    }
+    if device == "cuda" and num_workers > 0:
+        # Linux default is "fork", which can break when workers touch CUDA state.
+        loader_kwargs["multiprocessing_context"] = mp.get_context("spawn")
+
     loader = DataLoader(
         dataset,
-        batch_size=cfg.training.batch_size,
-        shuffle=True,
-        collate_fn=None if args.smoke_test else PerceptionTestVideoDataset.collate_fn,
-        num_workers=0 if args.smoke_test else cfg.data.num_workers,
-        pin_memory=(device == "cuda"),
-        drop_last=True,
+        **loader_kwargs,
     )
-    dbg(f"DataLoader ready: batch_size={cfg.training.batch_size}, num_workers={0 if args.smoke_test else cfg.data.num_workers}")
+    dbg(
+        f"DataLoader ready: batch_size={cfg.training.batch_size}, "
+        f"num_workers={num_workers}, "
+        f"mp_ctx={'spawn' if device == 'cuda' and num_workers > 0 else 'default'}"
+    )
 
     # ── WandB ──
     use_wandb = cfg.logging.use_wandb and not args.smoke_test

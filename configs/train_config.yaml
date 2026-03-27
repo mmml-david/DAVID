@@ -1,7 +1,7 @@
 model:
-  backbone_name: "Qwen/Qwen3-VL-8B-Instruct"
+  backbone_name: "Qwen/Qwen3-VL-2B-Instruct"
   backbone_dtype: "bfloat16"
-  input_dim: 4096         # Qwen3-VL-8B pooler_output dim (= latent dim)
+  input_dim: 2048         # Qwen3-VL-2B pooler_output dim (= latent dim)
   n_encoder_layers: 4
   n_decoder_layers: 4
   n_heads: 16
@@ -23,7 +23,7 @@ training:
 data:
   dataset_name: "chancharikm/QualityCheck"
   subset: "PerceptionTest"
-  feature_cache_dir: "/data/user_data/hsuanhal/11777/DAVID/features_cache/perception_test"
+  feature_cache_dir: "/data/user_data/hsuanhal/11777/DAVID/2B_features_cache/perception_test"
   sample_fps: 1.0         # sample 1 frame per second; videos vary in length so token count varies per video
   max_frames: 64          # safety cap to avoid OOM on unusually long videos
   num_workers: 4
@@ -32,10 +32,10 @@ extraction:
   dataset_name: "chancharikm/QualityCheck"
   subset: "PerceptionTest"
   split: "validation"
-  cache_dir: "/data/user_data/hsuanhal/11777/DAVID/features_cache/perception_test"
+  cache_dir: "/data/user_data/hsuanhal/11777/DAVID/2B_features_cache/perception_test"
   sample_fps: 1.0         # sample 1 frame per second
   max_frames: 64          # safety cap
-  model_name: "Qwen/Qwen3-VL-8B-Instruct"
+  model_name: "Qwen/Qwen3-VL-2B-Instruct"
   device: "cuda"
   max_samples: -1         # -1 = all samples
   num_shards: 8
