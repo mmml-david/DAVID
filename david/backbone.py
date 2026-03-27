@@ -66,11 +66,16 @@ class Qwen3VLBackbone:
         """
         pixel_values = pixel_values.to(self.device, dtype=self.dtype)
         grid_thw = grid_thw.to(self.device)
-
-        hidden_states, _deepstack = self._visual(pixel_values, grid_thw)
-
-        # hidden_states: [total_merged_tokens, D] (post spatial-merge)
-        pooler = hidden_states  # [total_merged_tokens, D]
+        # HF Qwen3-VL vision API changed across versions:
+        # - newer: ModelOutput with `pooler_output`
+        # - older: tuple-like outputs
+        try:
+            vision_out = self._visual(pixel_values, grid_thw, return_dict=True)
+            pooler = vision_out.pooler_output
+            if pooler is None:
+                raise AttributeError("vision_out.pooler_output is None")
+        except (TypeError, AttributeError):
+            pooler, _deepstack = self._visual(pixel_values, grid_thw)
 
         # Each video produces T * (H//2) * (W//2) tokens after spatial merge (factor=2)
         N_per_video = [
