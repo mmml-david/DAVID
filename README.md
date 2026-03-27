@@ -69,29 +69,58 @@ Train in online mode (extracts features on-the-fly — slower, no cache needed):
 python train.py --config configs/train_config.yaml --online
 ```
 
-### 4. Evaluate VQA sanity prompts (Qwen3-VL and DAVID+VAE)
+### 4. Evaluate VQA (Qwen3-VL and DAVID+VAE)
 
-Run caption-style prompting on PerceptionTest videos (defaults to `split=validation`):
+Evaluate multiple-choice VQA accuracy on the PerceptionTest validation set using per-sample questions from a JSON file:
 
 ```bash
-# Baseline Qwen3-VL only
+# Baseline Qwen3-VL only (all valid-set questions)
 python evaluate_vqa.py \
+    --questions_json perception_test.json \
     --method qwen \
-    --split validation \
-    --max_samples 100 \
-    --prompt "What is the video caption?"
+    --max_samples 0
+
+# With a smaller model
+python evaluate_vqa.py \
+    --questions_json perception_test.json \
+    --method qwen \
+    --max_samples 0 \
+    --model_name Qwen/Qwen3-VL-2B-Instruct
 
 # Side-by-side comparison (Qwen3-VL + DAVID reconstruction)
 python evaluate_vqa.py \
+    --questions_json perception_test.json \
     --method both \
-    --split validation \
-    --max_samples 100 \
-    --prompt "What is the video caption?" \
+    --max_samples 0 \
     --vae_checkpoint ./checkpoints/step_0050000.pt
+
+# Pipeline test with random VAE (no checkpoint needed)
+python evaluate_vqa.py \
+    --questions_json perception_test.json \
+    --method both \
+    --max_samples 10
+
+# 2B model requires matching VAE config
+python evaluate_vqa.py \
+    --questions_json perception_test.json \
+    --method both \
+    --max_samples 10 \
+    --model_name Qwen/Qwen3-VL-2B-Instruct \
+    --vae_config configs/train_config_2b_online.yaml
 ```
 
+Key flags:
+- `--questions_json`: Path to JSON with per-sample questions/options/answers. Filters to valid set and resolves video URLs to local HF cache.
+- `--max_samples 0`: Evaluate all available samples (default 100).
+- `--hf_cache_root`: Root of HF hub cache (default `/DATA/huggingface/hub`).
+- `--vae_device cpu`: Run VAE on CPU to avoid OOM when using large backbone models.
+- `--vae_config`: VAE config file; must match the backbone model's embedding dim (4096 for 8B, 2048 for 2B).
+
+Without `--questions_json`, the script falls back to the original single-prompt mode using HF dataset streaming.
+
+**Accuracy**: the script matches model responses against the correct answer by checking for the answer letter (e.g. "C"), standalone letter mentions (e.g. "The answer is C"), or the option text (e.g. "static or shaking"). Per-sample results include a `matched` field in the JSONL output.
+
 The script writes JSONL predictions and a summary JSON under `./eval_outputs/`.
-Note: the `chancharikm/QualityCheck` PerceptionTest subset currently exposes `train` and `validation` splits.
 
 ## Project Structure
 
