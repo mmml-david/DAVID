@@ -152,6 +152,7 @@ def load_vqa_samples_from_json(
     json_path: str,
     max_samples: int,
     cache_root: str,
+    video_root: str | None = None,
 ) -> list[VQASample]:
     """Load valid-set VQA samples from a JSON file and resolve video paths."""
     with open(json_path) as f:
@@ -167,8 +168,19 @@ def load_vqa_samples_from_json(
         # Extract video name from URL
         video_name = os.path.splitext(os.path.basename(video_url))[0]
 
-        # Resolve to local path
-        local_path = resolve_video_url_to_local(video_url, cache_root)
+        # Resolve to local path: try video_root first, then HF cache
+        local_path = None
+        if video_root is not None:
+            # Extract relative path after dataset name (e.g. "PerceptionTest/valid/video_X.mp4")
+            # from URL like ".../resolve/main/PerceptionTest/valid/video_X.mp4"
+            import re
+            m = re.search(r"/resolve/[^/]+/(.+)$", video_url)
+            if m:
+                candidate = os.path.join(video_root, m.group(1))
+                if os.path.exists(candidate):
+                    local_path = candidate
+        if local_path is None:
+            local_path = resolve_video_url_to_local(video_url, cache_root)
         if local_path is None or not os.path.exists(local_path):
             skipped += 1
             continue
@@ -232,6 +244,12 @@ def parse_args() -> argparse.Namespace:
         default="/DATA/huggingface/hub",
         help="Root directory of the HuggingFace hub cache where dataset blobs/snapshots live.",
     )
+    parser.add_argument(
+        "--video_root",
+        default=None,
+        help="Local directory containing dataset videos (e.g. /DATA/dataset/PerceptionTest). "
+             "Tried before HF cache resolution.",
+    )
 
     # Video / prompt args
     parser.add_argument("--sample_fps", type=float, default=1.0)
@@ -243,6 +261,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--do_sample", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument("--top_p", type=float, default=0.9)
+
+    # Visual token truncation (for baseline Qwen ablation)
+    parser.add_argument("--visual_prefix_ratio", type=float, default=None,
+                        help="Keep only the first X%% of visual tokens before LLM (e.g. 0.25 = 25%%). "
+                             "Applied to both qwen and david methods.")
 
     # DAVID args
     parser.add_argument("--vae_device", default="auto", help="'auto' (same as model), 'cpu', or 'cuda:X'")
@@ -494,6 +517,50 @@ def load_vae(vae_config_path: str, vae_checkpoint_path: str, device: torch.devic
     return vae
 
 
+class VisualPrefixTruncator:
+    """Zero-out visual tokens beyond the first `ratio` fraction (keeps token count unchanged)."""
+
+    def __init__(self, qwen_model, ratio: float | None):
+        self.ratio = ratio
+        self._target = qwen_model.model
+        self._orig = None
+
+    @staticmethod
+    def _zero_suffix(embeds, ratio):
+        """Keep the first `ratio` fraction of tokens, zero out the rest."""
+        out = []
+        for emb in embeds:
+            keep = max(1, int(emb.shape[0] * ratio))
+            zeroed = emb.clone()
+            zeroed[keep:] = 0
+            out.append(zeroed)
+        return out
+
+    def __enter__(self):
+        if self.ratio is None or self.ratio >= 1.0:
+            return self
+        orig = self._target.get_video_features
+
+        def truncated_get_video_features(this, pixel_values_videos, video_grid_thw, **kwargs):
+            result = orig(pixel_values_videos, video_grid_thw, **kwargs)
+            if isinstance(result, tuple):
+                video_embeds, deepstack = result
+                return VisualPrefixTruncator._zero_suffix(video_embeds, self.ratio), deepstack
+            else:
+                result.pooler_output = VisualPrefixTruncator._zero_suffix(
+                    result.pooler_output, self.ratio)
+                return result
+
+        self._orig = orig
+        self._target.get_video_features = types.MethodType(truncated_get_video_features, self._target)
+        return self
+
+    def __exit__(self, *args):
+        if self._orig is not None:
+            self._target.get_video_features = self._orig
+            self._orig = None
+
+
 class DavidVideoFeatureAdapter:
     """Temporarily replaces Qwen3-VL video features with DAVID reconstructions."""
 
@@ -574,13 +641,20 @@ class DavidVideoFeatureAdapter:
 
         def patched_get_video_features(this, pixel_values_videos, video_grid_thw, **kwargs):
             video_outputs = self._orig_get_video_features(pixel_values_videos, video_grid_thw, **kwargs)
-            video_embeds = video_outputs.pooler_output
-            deepstack_video_embeds = video_outputs.deepstack_features
-            recon_video_embeds = self._reconstruct_video_features(video_embeds)
-            adapted_deepstack = self._adapt_deepstack(deepstack_video_embeds, recon_video_embeds)
-            video_outputs.pooler_output = recon_video_embeds
-            video_outputs.deepstack_features = adapted_deepstack
-            return video_outputs
+            # Handle both tuple return (newer transformers) and named-attribute return (older)
+            if isinstance(video_outputs, tuple):
+                video_embeds, deepstack_video_embeds = video_outputs
+                recon_video_embeds = self._reconstruct_video_features(video_embeds)
+                adapted_deepstack = self._adapt_deepstack(deepstack_video_embeds, recon_video_embeds)
+                return recon_video_embeds, adapted_deepstack
+            else:
+                video_embeds = video_outputs.pooler_output
+                deepstack_video_embeds = video_outputs.deepstack_features
+                recon_video_embeds = self._reconstruct_video_features(video_embeds)
+                adapted_deepstack = self._adapt_deepstack(deepstack_video_embeds, recon_video_embeds)
+                video_outputs.pooler_output = recon_video_embeds
+                video_outputs.deepstack_features = adapted_deepstack
+                return video_outputs
 
         self._target.get_video_features = types.MethodType(patched_get_video_features, self._target)
         return self
@@ -719,7 +793,7 @@ def main() -> None:
     if use_json:
         # ── JSON-based VQA evaluation (valid set) ──
         print(f"Loading VQA questions from: {args.questions_json}")
-        vqa_samples = load_vqa_samples_from_json(args.questions_json, args.max_samples, args.hf_cache_root)
+        vqa_samples = load_vqa_samples_from_json(args.questions_json, args.max_samples, args.hf_cache_root, args.video_root)
         print(f"Loaded {len(vqa_samples)} valid-set VQA samples")
 
         split_label = "valid"
@@ -757,8 +831,9 @@ def main() -> None:
                     error = None
 
                     try:
-                        ctx = nullcontext() if method == "qwen" else david_adapter
-                        with ctx:
+                        david_ctx = nullcontext() if method == "qwen" else david_adapter
+                        trunc_ctx = VisualPrefixTruncator(model, args.visual_prefix_ratio)
+                        with trunc_ctx, david_ctx:
                             response = run_generation(
                                 model=model,
                                 processor=processor,
@@ -846,8 +921,9 @@ def main() -> None:
                     error = None
 
                     try:
-                        ctx = nullcontext() if method == "qwen" else david_adapter
-                        with ctx:
+                        david_ctx = nullcontext() if method == "qwen" else david_adapter
+                        trunc_ctx = VisualPrefixTruncator(model, args.visual_prefix_ratio)
+                        with trunc_ctx, david_ctx:
                             response = run_generation(
                                 model=model,
                                 processor=processor,
@@ -909,6 +985,8 @@ def main() -> None:
             "max_samples": args.max_samples,
         },
         "prompt": "per-sample MCQ" if use_json else args.prompt,
+        "visual_prefix_ratio": args.visual_prefix_ratio,
+        "vae_prefix_ratio": args.vae_prefix_ratio,
         "methods": methods,
         "n_records": len(records),
         "n_errors": sum(1 for r in records if r["error"] is not None),
