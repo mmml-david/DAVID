@@ -1,7 +1,7 @@
 model:
   backbone_name: "Qwen/Qwen3-VL-8B-Instruct"
   backbone_dtype: "bfloat16"
-  input_dim: 4096         # Qwen3-VL-2B pooler_output dim (= latent dim)
+  input_dim: 4096         # Qwen3-VL-8B pooler_output dim (= latent dim)
   n_encoder_layers: 4
   n_decoder_layers: 4
   n_heads: 16

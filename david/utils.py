@@ -1,4 +1,4 @@
-"""Utility functions for padding, masking, feature interpolation, and EMA."""
+"""Utility functions for padding, masking, feature interpolation, EMA, and video I/O."""
 
 import torch
 import torch.nn as nn
@@ -93,6 +93,38 @@ class EMAModel:
     def load_state_dict(self, state: dict) -> None:
         self.decay = state["decay"]
         self.shadow = state["shadow"]
+
+
+def sample_frame_indices_at_fps(
+    total_frames: int, video_fps: float, sample_fps: float, max_frames: int
+) -> list[int]:
+    """Return frame indices sampled at sample_fps, capped at max_frames."""
+    stride = video_fps / sample_fps
+    n = min(int(total_frames / stride), max_frames)
+    return [int(i * stride) for i in range(n)]
+
+
+def open_video_reader(video_source):
+    """Open a decord VideoReader from a video source (dict, bytes, or path string).
+
+    Handles the three formats returned by HuggingFace datasets:
+      - dict with 'path' key  (Video(decode=False))
+      - dict with 'bytes' key (Video(decode=False) without local file)
+      - raw bytes
+      - plain path string
+    """
+    import io
+    import decord
+    if isinstance(video_source, dict):
+        if video_source.get("path") is not None:
+            return decord.VideoReader(video_source["path"], ctx=decord.cpu(0))
+        elif video_source.get("bytes") is not None:
+            return decord.VideoReader(io.BytesIO(video_source["bytes"]), ctx=decord.cpu(0))
+        else:
+            raise ValueError(f"Video dict has neither 'path' nor 'bytes': {list(video_source.keys())}")
+    elif isinstance(video_source, bytes):
+        return decord.VideoReader(io.BytesIO(video_source), ctx=decord.cpu(0))
+    return decord.VideoReader(video_source, ctx=decord.cpu(0))
 
 
 def interpolate_features(features: Tensor, target_n: int) -> Tensor:

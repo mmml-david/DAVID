@@ -96,5 +96,71 @@ class Qwen3VLBackbone:
 
         return features, mask
 
+    def extract_features_from_frames(
+        self,
+        frames,
+        sample_fps: float,
+        min_pixels: int | None = None,
+        max_pixels: int | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        """Run a numpy frame array through the processor and vision backbone.
+
+        Args:
+            frames: [T, H, W, C] numpy array of video frames.
+            sample_fps: Frame rate used when sampling (for per-frame timestamps).
+            min_pixels: Optional lower bound on pixel budget for resizing.
+            max_pixels: Optional upper bound on pixel budget for resizing.
+
+        Returns:
+            features: [1, N, D]
+            mask:     [1, N]
+        """
+        from PIL import Image
+        from qwen_vl_utils import process_vision_info
+
+        frame_list = [Image.fromarray(f) for f in frames]
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "video", 
+                        "video": frame_list, 
+                        "fps": sample_fps,
+                        # "nframes": len(frame_list),
+                    },
+                    {"type": "text", "text": "Describe the video."},
+                ],
+            }
+        ]
+
+        text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        _, video_inputs, video_kwargs = process_vision_info(messages, return_video_kwargs=True)
+        # process_vision_info cannot infer fps from PIL images; provide VideoMetadata
+        # explicitly so Qwen3-VL builds correct per-frame timestamps.
+        video_kwargs.pop("fps", None)
+
+        processor_kwargs = dict(
+            text=[text],
+            videos=video_inputs,
+            video_metadata=[{
+                "fps": sample_fps,
+                "total_num_frames": len(frame_list),
+                "frames_indices": list(range(len(frame_list))),
+            }],
+            **video_kwargs,
+            return_tensors="pt",
+        )
+        if min_pixels is not None or max_pixels is not None:
+            vk = {}
+            if min_pixels is not None:
+                vk["min_pixels"] = min_pixels
+            if max_pixels is not None:
+                vk["max_pixels"] = max_pixels
+            processor_kwargs["videos_kwargs"] = vk
+
+        inputs = self.processor(**processor_kwargs)
+        return self.extract_features(inputs["pixel_values_videos"], inputs["video_grid_thw"])
+
     def get_processor(self):
         return self.processor
