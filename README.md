@@ -54,19 +54,11 @@ python train.py --config configs/train_config.yaml --smoke_test
 ### 3. Train
 
 ```bash
-<<<<<<< HEAD
-# Single GPU
-python train.py --config configs/train_config.yaml
-
-# Multi-GPU via torchrun
-torchrun --nproc_per_node=4 train.py --config configs/train_config.yaml
-=======
 # Single GPU (cached features)
 python train.py --config configs/train_config.yaml
 
 # Multi-GPU via torchrun
 torchrun --nproc_per_node=2 train.py --config configs/train_config.yaml
->>>>>>> c25f7cc (✨ [Add] new subset of validation set)
 ```
 
 Resume from the latest checkpoint:
@@ -81,7 +73,6 @@ Train in online mode (extracts features on-the-fly — slower, no cache needed):
 python train.py --config configs/train_config.yaml --online
 ```
 
-<<<<<<< HEAD
 Override the WandB run name:
 
 ```bash
@@ -97,9 +88,6 @@ python train.py --config configs/train_config_2b_online.yaml --online
 ### 4. Evaluate VQA (Qwen3-VL and DAVID+VAE)
 
 Evaluate multiple-choice VQA accuracy on the PerceptionTest validation set using per-sample questions from a JSON file:
-=======
-For the 2B backbone, use the corresponding config:
->>>>>>> c25f7cc (✨ [Add] new subset of validation set)
 
 ```bash
 python train.py --config configs/train_config_2b_online.yaml
@@ -182,7 +170,6 @@ DAVID/
 ├── pyproject.toml
 ├── perception_test.json         # Per-sample VQA questions for evaluation
 ├── configs/
-<<<<<<< HEAD
 │   ├── train_config.yaml        # 8B model — cached feature training
 │   └── train_config_2b_online.yaml  # 2B model — online mode, lower VRAM
 ├── david/
@@ -194,22 +181,6 @@ DAVID/
 ├── extract_features.py          # One-time offline feature extraction
 ├── evaluate_vqa.py              # VQA accuracy evaluation (Qwen3-VL and DAVID+VAE)
 └── train.py                     # Main training entry point (single-GPU and DDP)
-=======
-│   ├── train_config.yaml              # Hyperparameters for 8B backbone
-│   └── train_config_2b_online.yaml    # Hyperparameters for 2B backbone
-├── david/
-│   ├── backbone.py                    # Frozen Qwen3-VL vision encoder (LLM weights discarded)
-│   ├── vae.py                         # DAVIDEncoder + DAVIDDecoder + DAVIDVAE
-│   ├── dataset.py                     # Dataset loader (cached and online modes)
-│   ├── loss.py                        # Adaptive recon loss + KL + beta warm-up scheduler
-│   └── utils.py                       # Padding, masking, interpolation helpers
-├── extract_features.py                # One-time offline feature extraction
-├── train.py                           # Training entry point (single/multi-GPU)
-├── evaluate_vqa.py                    # VQA evaluation (baseline + DAVID)
-├── download_videos.py                 # Download dataset videos from HuggingFace
-├── perception_test.json               # Full validation question set
-└── perception_test_mini100.json       # Stratified 100-sample mini set
->>>>>>> c25f7cc (✨ [Add] new subset of validation set)
 ```
 
 ## Configuration
