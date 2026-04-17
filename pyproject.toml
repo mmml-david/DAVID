@@ -4,8 +4,8 @@ version = "0.1.0"
 description = "Dynamic Adaptive Video Inference and Decoding"
 requires-python = ">=3.11"
 dependencies = [
-    "torch>=2.3.0,<2.11.0",
-    "torchvision>=0.18.0,<0.22.0",
+    "torch>=2.7.0,<2.11.0",
+    "torchvision>=0.22.0,<0.26.0",
     "transformers>=4.49.0",
     "accelerate>=0.30.0",
     "datasets>=2.19.0",
@@ -19,3 +19,6 @@ dependencies = [
     "pillow>=10.0.0",
     "python-dotenv>=1.2.2",
 ]
+
+[tool.uv]
+torch-backend = "cu128"

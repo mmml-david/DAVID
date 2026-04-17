@@ -22,13 +22,15 @@ training:
   ema_decay: 0.999
 
 data:
-  dataset_name: "/DATA/dataset/PerceptionTest"
+  dataset_name: "chancharikm/QualityCheck"
   subset: "PerceptionTest"
   feature_cache_dir: "/data/user_data/hsuanhal/11777/DAVID/features_cache/perception_test"
   sample_fps: 1.0         # sample 1 frame per second; videos vary in length so token count varies per video
   max_frames: 64          # safety cap to avoid OOM on unusually long videos
   min_pixels: 16384       # 128*128 — minimum pixel budget for video frame resizing
   max_pixels: 204800      # 320*640 — maximum pixel budget for video frame resizing
+  shortest_edge: 16384    # maps to min_pixels in smart_resize (total pixel budget lower bound)
+  longest_edge: 204800    # maps to max_pixels in smart_resize (total pixel budget upper bound)
   num_workers: 0
 
 extraction:

@@ -134,7 +134,7 @@ def make_dataset(cfg, split, mode, backbone=None):
     from david.dataset import PerceptionTestVideoDataset
     if mode == "online":
         return PerceptionTestVideoDataset(
-            feature_cache_dir=cfg.data.feature_cache_dir,
+            feature_cache_dir=getattr(cfg.data, 'feature_cache_dir', None),
             split=split,
             mode="online",
             hf_dataset_name=cfg.data.dataset_name,
@@ -144,6 +144,8 @@ def make_dataset(cfg, split, mode, backbone=None):
             max_frames=cfg.data.max_frames,
             min_pixels=getattr(cfg.data, 'min_pixels', None),
             max_pixels=getattr(cfg.data, 'max_pixels', None),
+            shortest_edge=getattr(cfg.data, 'shortest_edge', None),
+            longest_edge=getattr(cfg.data, 'longest_edge', None),
         )
     return PerceptionTestVideoDataset(
         feature_cache_dir=cfg.data.feature_cache_dir,

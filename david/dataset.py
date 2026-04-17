@@ -45,12 +45,18 @@ class PerceptionTestVideoDataset(Dataset):
         max_frames: int = 64,
         min_pixels: int | None = None,
         max_pixels: int | None = None,
+        shortest_edge: int | None = None,
+        longest_edge: int | None = None,
     ):
         self.mode = mode
         self.split = split
         self.sample_fps = sample_fps
         self.min_pixels = min_pixels
         self.max_pixels = max_pixels
+        # shortest_edge/longest_edge are passed directly to the processor's size dict;
+        # fall back to min_pixels/max_pixels if not provided
+        self.shortest_edge = shortest_edge if shortest_edge is not None else min_pixels
+        self.longest_edge = longest_edge if longest_edge is not None else max_pixels
 
         if mode == "cached":
             cache_path = Path(feature_cache_dir) / split
@@ -160,13 +166,13 @@ class PerceptionTestVideoDataset(Dataset):
             **video_kwargs,
             return_tensors="pt",
         )
-        if self.min_pixels is not None or self.max_pixels is not None:
-            vk = {}
-            if self.min_pixels is not None:
-                vk["min_pixels"] = self.min_pixels
-            if self.max_pixels is not None:
-                vk["max_pixels"] = self.max_pixels
-            processor_kwargs["videos_kwargs"] = vk
+        if self.shortest_edge is not None or self.longest_edge is not None:
+            size = {}
+            if self.shortest_edge is not None:
+                size["shortest_edge"] = self.shortest_edge
+            if self.longest_edge is not None:
+                size["longest_edge"] = self.longest_edge
+            processor_kwargs["videos_kwargs"] = {"size": size}
         inputs = self.processor(**processor_kwargs)
 
         pixel_values = inputs["pixel_values_videos"]  # [total_patches, C*t*h*w]
