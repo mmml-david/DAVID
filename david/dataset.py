@@ -6,7 +6,6 @@ Supports two modes:
 """
 
 import os
-import io
 import logging
 import torch
 
@@ -75,7 +74,6 @@ class PerceptionTestVideoDataset(Dataset):
             assert backbone is not None, "backbone required for online mode"
             self.backbone = backbone
             self.max_frames = max_frames
-            self.processor = backbone.get_processor()
 
             print(f"[Dataset] Online mode: streaming {hf_dataset_name} / {subset}")
             ds = load_dataset(
@@ -103,83 +101,25 @@ class PerceptionTestVideoDataset(Dataset):
 
     def _online_getitem(self, idx: int) -> dict:
         """Extract features on-the-fly for a single video."""
-        import decord
-        from PIL import Image
-        from qwen_vl_utils import process_vision_info
+        from .utils import open_video_reader, sample_frame_indices_at_fps
 
         sample = self.dataset[idx]
 
-        # Try common video field names
-        video_source = None
-        for field in ["video", "video_bytes", "mp4"]:
-            if field in sample and sample[field] is not None:
-                video_source = sample[field]
-                break
-
+        video_source = next(
+            (sample[f] for f in ["video", "video_bytes", "mp4"] if f in sample and sample[f] is not None),
+            None,
+        )
         if video_source is None:
             raise ValueError(f"No video field found in sample {idx}. Keys: {list(sample.keys())}")
 
-        # Decode video frames using decord
-        if isinstance(video_source, dict):
-            if video_source.get("path") is not None:
-                vr = decord.VideoReader(video_source["path"], ctx=decord.cpu(0))
-            elif video_source.get("bytes") is not None:
-                vr = decord.VideoReader(io.BytesIO(video_source["bytes"]), ctx=decord.cpu(0))
-            else:
-                raise ValueError(
-                    f"Video dict in sample {idx} has neither 'path' nor 'bytes': {video_source.keys()}"
-                )
-        elif isinstance(video_source, bytes):
-            vr = decord.VideoReader(io.BytesIO(video_source), ctx=decord.cpu(0))
-        else:
-            vr = decord.VideoReader(video_source, ctx=decord.cpu(0))
-
-        video_fps = vr.get_avg_fps()
-        total_frames = len(vr)
-        indices = _sample_frame_indices_at_fps(total_frames, video_fps, self.sample_fps, self.max_frames)
+        vr = open_video_reader(video_source)
+        indices = sample_frame_indices_at_fps(len(vr), vr.get_avg_fps(), self.sample_fps, self.max_frames)
         frames = vr.get_batch(indices).asnumpy()  # [T, H, W, C]
 
-        # qwen_vl_utils expects each frame to be path/url/PIL.Image in list/tuple form.
-        frame_list = [Image.fromarray(frame) for frame in frames]
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "video",
-                        "video": frame_list,
-                        "nframes": len(frame_list),
-                    },
-                    {"type": "text", "text": "Describe the video."},
-                ],
-            }
-        ]
-
-        text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        image_inputs, video_inputs, video_kwargs = process_vision_info(messages, return_video_kwargs=True)
-        if isinstance(video_kwargs.get("fps"), list) and len(video_kwargs["fps"]) == 1:
-            video_kwargs["fps"] = video_kwargs["fps"][0]
-
-        processor_kwargs = dict(
-            text=[text],
-            videos=video_inputs,
-            **video_kwargs,
-            return_tensors="pt",
+        features, mask = self.backbone.extract_features_from_frames(
+            frames, self.sample_fps, self.min_pixels, self.max_pixels,
+            self.shortest_edge, self.longest_edge,
         )
-        if self.shortest_edge is not None or self.longest_edge is not None:
-            size = {}
-            if self.shortest_edge is not None:
-                size["shortest_edge"] = self.shortest_edge
-            if self.longest_edge is not None:
-                size["longest_edge"] = self.longest_edge
-            processor_kwargs["videos_kwargs"] = {"size": size}
-        inputs = self.processor(**processor_kwargs)
-
-        pixel_values = inputs["pixel_values_videos"]  # [total_patches, C*t*h*w]
-        grid_thw = inputs["video_grid_thw"]           # [1, 3]
-
-        features, mask = self.backbone.extract_features(pixel_values, grid_thw)
-        # features: [1, N, D], mask: [1, N] — squeeze batch dim
         return {"features": features[0].cpu(), "mask": mask[0].cpu()}
 
     @staticmethod
@@ -199,12 +139,3 @@ class PerceptionTestVideoDataset(Dataset):
         feature_list = [item["features"] for item in batch]
         features, mask = pad_sequence_to_max(feature_list)
         return {"features": features, "mask": mask}
-
-
-def _sample_frame_indices_at_fps(
-    total_frames: int, video_fps: float, sample_fps: float, max_frames: int
-) -> list[int]:
-    """Return frame indices sampled at sample_fps, capped at max_frames."""
-    stride = video_fps / sample_fps
-    n = min(int(total_frames / stride), max_frames)
-    return [int(i * stride) for i in range(n)]

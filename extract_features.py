@@ -32,7 +32,6 @@ Re-running is safe — existing files are skipped (resume support).
 """
 
 import argparse
-import io
 import os
 from pathlib import Path
 from typing import Any
@@ -125,21 +124,6 @@ def resolve_args(args, config_path: str) -> argparse.Namespace:
     return args
 
 
-def sample_frame_indices_at_fps(
-    total_frames: int, video_fps: float, sample_fps: float, max_frames: int
-) -> list[int]:
-    """Return frame indices sampled at sample_fps, capped at max_frames.
-
-    Args:
-        total_frames: Total number of frames in the video.
-        video_fps:    Native fps of the video (from decord).
-        sample_fps:   Desired sampling rate (e.g. 1.0 for 1 fps).
-        max_frames:   Hard cap to avoid OOM on unusually long videos.
-    """
-    stride = video_fps / sample_fps          # e.g. 30fps / 1fps = take every 30th frame
-    n = min(int(total_frames / stride), max_frames)
-    return [int(i * stride) for i in range(n)]
-
 
 def _ensure_symlink(path: str) -> str:
     """Recreate a missing HF hub snapshot symlink from the already-downloaded local blob.
@@ -174,92 +158,32 @@ def _ensure_symlink(path: str) -> str:
         return path  # blob not present; caller will get a decord error
 
 
-def extract_one(sample, backbone, processor, sample_fps: float, max_frames: int,
+def extract_one(sample, backbone, sample_fps: float, max_frames: int,
                 min_pixels: int | None = None, max_pixels: int | None = None):
     """Extract Qwen3-VL features from a single dataset sample."""
-    import decord
-    from PIL import Image
-    from qwen_vl_utils import process_vision_info
+    from david.utils import open_video_reader, sample_frame_indices_at_fps
 
-    # Try common video field names
-    video_source = None
-    for field in ["video", "video_bytes", "mp4"]:
-        if field in sample and sample[field] is not None:
-            video_source = sample[field]
-            break
-
+    video_source = next(
+        (sample[f] for f in ["video", "video_bytes", "mp4"] if f in sample and sample[f] is not None),
+        None,
+    )
     if video_source is None:
         return None, f"No video field. Keys: {list(sample.keys())}"
 
     try:
-        if isinstance(video_source, dict):
-            # datasets.Video(decode=False) returns {"path": ..., "bytes": ...}
-            if video_source.get("path") is not None:
-                path = video_source["path"]
-                if not os.path.exists(path):
-                    path = _ensure_symlink(path)
-                vr = decord.VideoReader(path, ctx=decord.cpu(0))
-            elif video_source.get("bytes") is not None:
-                vr = decord.VideoReader(io.BytesIO(video_source["bytes"]), ctx=decord.cpu(0))
-            else:
-                return None, "Video dict has neither 'path' nor 'bytes'"
-        elif isinstance(video_source, bytes):
-            vr = decord.VideoReader(io.BytesIO(video_source), ctx=decord.cpu(0))
-        else:
-            vr = decord.VideoReader(video_source, ctx=decord.cpu(0))
-
-        video_fps = vr.get_avg_fps()
-        total_frames = len(vr)
-        indices = sample_frame_indices_at_fps(total_frames, video_fps, sample_fps, max_frames)
+        # Resolve broken HF hub snapshot symlinks before opening
+        if isinstance(video_source, dict) and video_source.get("path") is not None:
+            path = video_source["path"]
+            if not os.path.exists(path):
+                video_source = dict(video_source, path=_ensure_symlink(path))
+        vr = open_video_reader(video_source)
+        indices = sample_frame_indices_at_fps(len(vr), vr.get_avg_fps(), sample_fps, max_frames)
         frames = vr.get_batch(indices).asnumpy()  # [T, H, W, C]
     except Exception as e:
         return None, f"Video decode error: {e}"
 
-    # qwen_vl_utils expects each frame to be path/url/PIL.Image in list/tuple form.
-    frame_list = [Image.fromarray(frame) for frame in frames]
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {
-                    "type": "video",
-                    "video": frame_list,
-                    "fps": sample_fps,
-                },
-                {"type": "text", "text": "Describe the video."},
-            ],
-        }
-    ]
-
-    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    image_inputs, video_inputs, video_kwargs = process_vision_info(messages, return_video_kwargs=True)
-    # process_vision_info cannot infer fps from PIL images; provide VideoMetadata
-    # explicitly so Qwen3-VL builds correct per-frame timestamps (idx/fps seconds)
-    # instead of defaulting to 24 fps. Pop fps from video_kwargs to avoid conflict.
-    video_kwargs.pop("fps", None)
-
-    processor_kwargs = dict(
-        text=[text],
-        videos=video_inputs,
-        video_metadata=[{"fps": sample_fps, "total_num_frames": len(frame_list), "frames_indices": list(range(len(frame_list)))}],
-        **video_kwargs,
-        return_tensors="pt",
-    )
-    if min_pixels is not None or max_pixels is not None:
-        vk = {}
-        if min_pixels is not None:
-            vk["min_pixels"] = min_pixels
-        if max_pixels is not None:
-            vk["max_pixels"] = max_pixels
-        processor_kwargs["videos_kwargs"] = vk
-    inputs = processor(**processor_kwargs)
-
-    pixel_values = inputs["pixel_values_videos"]
-    grid_thw = inputs["video_grid_thw"]
-
-    features, mask = backbone.extract_features(pixel_values, grid_thw)
-    # features: [1, N, D], squeeze batch dim, save as float16.
-    # Mask is not saved — each file is one complete video so all tokens are always valid.
+    features, _ = backbone.extract_features_from_frames(frames, sample_fps, min_pixels, max_pixels)
+    # Save as float16; mask not stored — always all-True for a single complete video.
     return {"features": features[0].cpu().half()}, None
 
 
@@ -292,7 +216,6 @@ def main():
         device=args.device,
         dtype=torch.bfloat16,
     )
-    processor = backbone.get_processor()
 
     # Load dataset
     print(f"Loading dataset {args.dataset_name} / {args.subset} split={args.split}")
@@ -342,7 +265,7 @@ def main():
             continue  # resume support
 
         sample = ds[row_idx]
-        result, err = extract_one(sample, backbone, processor, args.sample_fps, args.max_frames,
+        result, err = extract_one(sample, backbone, args.sample_fps, args.max_frames,
                                   args.min_pixels, args.max_pixels)
 
         if err is not None:
