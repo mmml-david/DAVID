@@ -1,4 +1,4 @@
-"""Loss functions and beta scheduler for DAVID VAE training."""
+"""Loss functions and schedulers for DAVID VAE training."""
 
 import torch
 from torch import Tensor
@@ -48,7 +48,8 @@ class LossOutput:
     mse: float
     kl: float
     beta: float
-    m: int  # truncation index used
+    m: int              # truncation index used
+    entropy: float = 0.0  # attention column-entropy term (0 when disabled)
 
 
 def david_loss(
@@ -58,16 +59,20 @@ def david_loss(
     logvar: Tensor,
     beta: float,
     m: int,
+    lambda_entropy: float = 0.0,
+    attn_entropy: Tensor | None = None,
 ) -> LossOutput:
-    """Combined DAVID VAE loss: adaptive recon + beta * KL.
+    """Combined DAVID VAE loss: adaptive recon + beta * KL + lambda * attn_entropy.
 
     Args:
-        recon:  [B, N, D]
-        target: [B, N, D]
-        mu:     [B, N, D]
-        logvar: [B, N, D]
-        beta:   KL weight (keep small, annealed from 0 during training)
-        m:      Truncation prefix length
+        recon:          [B, N, D]
+        target:         [B, N, D]
+        mu:             [B, N, D]
+        logvar:         [B, N, D]
+        beta:           KL weight (annealed from 0)
+        m:              Truncation prefix length
+        lambda_entropy: Weight for attention column-entropy regularisation (annealed from 0)
+        attn_entropy:   Scalar Tensor from DAVIDVAE (None when compute_attn_entropy=False)
 
     Returns:
         LossOutput with total loss tensor and scalar metrics.
@@ -76,7 +81,20 @@ def david_loss(
     recon_loss = reconstruction_loss(recon, target, m, N)
     kl = kl_loss(mu, logvar)
     total = recon_loss + beta * kl
-    return LossOutput(total=total, mse=recon_loss.item(), kl=kl.item(), beta=beta, m=m)
+
+    entropy_val = 0.0
+    if attn_entropy is not None and lambda_entropy > 0.0:
+        total = total + lambda_entropy * attn_entropy
+        entropy_val = attn_entropy.item()
+
+    return LossOutput(
+        total=total,
+        mse=recon_loss.item(),
+        kl=kl.item(),
+        beta=beta,
+        m=m,
+        entropy=entropy_val,
+    )
 
 
 class BetaScheduler:
@@ -99,3 +117,28 @@ class BetaScheduler:
             return self.beta_target
         progress = (step - self.warmup_start) / (self.warmup_end - self.warmup_start)
         return self.beta_target * progress
+
+
+class LambdaScheduler:
+    """Linear warm-up scheduler for the attention entropy regularisation weight λ.
+
+    lambda = 0 for steps 0..warmup_start
+    lambda linearly ramps from 0 to lambda_target over warmup_start..warmup_end
+    lambda = lambda_target for steps > warmup_end
+
+    Mirrors BetaScheduler exactly; kept separate so the two weights can be tuned
+    independently and logged with distinct names.
+    """
+
+    def __init__(self, lambda_target: float, warmup_start: int, warmup_end: int):
+        self.lambda_target = lambda_target
+        self.warmup_start = warmup_start
+        self.warmup_end = warmup_end
+
+    def get_lambda(self, step: int) -> float:
+        if step <= self.warmup_start:
+            return 0.0
+        if step >= self.warmup_end:
+            return self.lambda_target
+        progress = (step - self.warmup_start) / (self.warmup_end - self.warmup_start)
+        return self.lambda_target * progress
