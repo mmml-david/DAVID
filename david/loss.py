@@ -103,28 +103,54 @@ class BetaScheduler:
 
 
 class MRatioScheduler:
-    """Linear schedule for prefix sampling ratio used by m ~ Uniform(1, floor(N * ratio)).
+    """Linear schedule for sliding prefix-ratio sampling window.
 
-    ratio = ratio_start for steps 0..warmup_start
-    ratio linearly ramps to ratio_end over warmup_start..warmup_end
-    ratio = ratio_end for steps > warmup_end
+    m is sampled from a ratio window [lo_ratio, hi_ratio] over N tokens:
+      m ~ Uniform(floor(N * lo_ratio), floor(N * hi_ratio))
+
+    The window endpoints are linearly scheduled:
+      lo_ratio: lo_start -> lo_end
+      hi_ratio: hi_start -> hi_end
+
+    Ratios are not clipped to 1.0 so values like hi_ratio=1.1 are allowed, and
+    converted token bounds are clamped into [0, N].
     """
 
-    def __init__(self, ratio_start: float, ratio_end: float, warmup_start: int, warmup_end: int):
-        self.ratio_start = float(max(0.0, min(1.0, ratio_start)))
-        self.ratio_end = float(max(0.0, min(1.0, ratio_end)))
+    def __init__(
+        self,
+        lo_start: float,
+        hi_start: float,
+        lo_end: float,
+        hi_end: float,
+        warmup_start: int,
+        warmup_end: int,
+    ):
+        self.lo_start = float(lo_start)
+        self.hi_start = float(hi_start)
+        self.lo_end = float(lo_end)
+        self.hi_end = float(hi_end)
         self.warmup_start = warmup_start
         self.warmup_end = warmup_end
 
-    def get_ratio(self, step: int) -> float:
+    @staticmethod
+    def _lerp(start: float, end: float, progress: float) -> float:
+        return start + progress * (end - start)
+
+    def get_ratio_window(self, step: int) -> tuple[float, float]:
         if step <= self.warmup_start:
-            return self.ratio_start
-        if step >= self.warmup_end:
-            return self.ratio_end
-        progress = (step - self.warmup_start) / (self.warmup_end - self.warmup_start)
-        return self.ratio_start + progress * (self.ratio_end - self.ratio_start)
+            lo, hi = self.lo_start, self.hi_start
+        elif step >= self.warmup_end:
+            lo, hi = self.lo_end, self.hi_end
+        else:
+            progress = (step - self.warmup_start) / (self.warmup_end - self.warmup_start)
+            lo = self._lerp(self.lo_start, self.lo_end, progress)
+            hi = self._lerp(self.hi_start, self.hi_end, progress)
+        return (min(lo, hi), max(lo, hi))
 
     def sample_m(self, step: int, n_tokens: int) -> int:
-        ratio = self.get_ratio(step)
-        upper = min(n_tokens, max(1, math.floor(n_tokens * ratio)))
-        return torch.randint(1, upper + 1, (1,)).item()
+        lo_ratio, hi_ratio = self.get_ratio_window(step)
+        lower = max(0, min(n_tokens, math.floor(n_tokens * lo_ratio)))
+        upper = max(0, min(n_tokens, math.floor(n_tokens * hi_ratio)))
+        if upper < lower:
+            lower, upper = upper, lower
+        return torch.randint(lower, upper + 1, (1,)).item()

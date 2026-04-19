@@ -54,19 +54,11 @@ python train.py --config configs/train_config.yaml --smoke_test
 ### 3. Train
 
 ```bash
-<<<<<<< HEAD
-# Single GPU
-python train.py --config configs/train_config.yaml
-
-# Multi-GPU via torchrun
-torchrun --nproc_per_node=4 train.py --config configs/train_config.yaml
-=======
 # Single GPU (cached features)
 python train.py --config configs/train_config.yaml
 
 # Multi-GPU via torchrun
 torchrun --nproc_per_node=2 train.py --config configs/train_config.yaml
->>>>>>> c25f7cc (✨ [Add] new subset of validation set)
 ```
 
 Resume from the latest checkpoint:
@@ -81,7 +73,6 @@ Train in online mode (extracts features on-the-fly — slower, no cache needed):
 python train.py --config configs/train_config.yaml --online
 ```
 
-<<<<<<< HEAD
 Override the WandB run name:
 
 ```bash
@@ -97,9 +88,7 @@ python train.py --config configs/train_config_2b_online.yaml --online
 ### 4. Evaluate VQA (Qwen3-VL and DAVID+VAE)
 
 Evaluate multiple-choice VQA accuracy on the PerceptionTest validation set using per-sample questions from a JSON file:
-=======
 For the 2B backbone, use the corresponding config:
->>>>>>> c25f7cc (✨ [Add] new subset of validation set)
 
 ```bash
 python train.py --config configs/train_config_2b_online.yaml
