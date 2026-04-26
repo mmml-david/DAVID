@@ -82,10 +82,9 @@ def david_loss(
     kl = kl_loss(mu, logvar)
     total = recon_loss + beta * kl
 
-    entropy_val = 0.0
+    entropy_val = attn_entropy.item() if attn_entropy is not None else 0.0
     if attn_entropy is not None and lambda_entropy > 0.0:
         total = total + lambda_entropy * attn_entropy
-        entropy_val = attn_entropy.item()
 
     return LossOutput(
         total=total,
