@@ -8,6 +8,8 @@ model:
   dropout: 0.1
   progressive_ratio: 0.0    # 0.0 = no mask, 0.5 = token N-1 sees ~N/2 random, 1.0 = sees ~1 random
   grad_checkpoint: true     # recompute activations on backward pass to reduce activation memory
+  entropy_decoder_layers: 0    # first K decoder layers get column-entropy reg; 0 = off, e.g. 2 = first half
+  entropy_layer_decay: 1.0     # weight decay per layer; 1.0 = uniform, 0.5 = layer 0 twice as strong as layer 1
 
 training:
   batch_size: 2
@@ -18,12 +20,16 @@ training:
   warmup_steps: 1000
   beta_target: 1.0e-4
   beta_warmup_steps: 10000
+
   m_ratio_min_start: 0.0    # early window lower bound: m ~ Uniform(floor(0.0N), floor(0.5N))
   m_ratio_max_start: 0.5
   m_ratio_min_end: 0.6      # late window lower bound
   m_ratio_max_end: 1.1      # late window upper bound (values >1 are clamped to N tokens)
   m_ratio_warmup_start: 0 
   m_ratio_warmup_steps: 1000 
+  
+  lambda_entropy_target: 1.0e-3   # weight for attention column-entropy loss (0 = disabled)
+  lambda_entropy_warmup_steps: 5000
   grad_clip: 1.0
   ema_decay: 0.999
 

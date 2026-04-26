@@ -207,7 +207,7 @@ def main():
 
     # ── Imports (deferred so smoke tests don't require full deps) ──
     from david.vae import DAVIDVAE, DAVIDConfig
-    from david.loss import david_loss, BetaScheduler, MRatioScheduler
+    from david.loss import david_loss, BetaScheduler, MRatioScheduler, LambdaScheduler
     from david.dataset import PerceptionTestVideoDataset
     from david.utils import EMAModel
 
@@ -258,6 +258,11 @@ def main():
         hi_end=m_ratio_max_end,
         warmup_start=m_ratio_warmup_start,
         warmup_end=m_ratio_warmup_start + m_ratio_warmup_steps,
+    )
+    lambda_sched = LambdaScheduler(
+        lambda_target=getattr(cfg.training, 'lambda_entropy_target', 0.0),
+        warmup_start=cfg.training.warmup_steps,
+        warmup_end=cfg.training.warmup_steps + getattr(cfg.training, 'lambda_entropy_warmup_steps', 5000),
     )
 
     # ── Dataset ──
@@ -436,6 +441,7 @@ def main():
                 # Compute loss (reconstruct original features, masked for padding)
                 dbg("Computing loss")
                 beta = beta_sched.get_beta(step)
+                lambda_entropy = lambda_sched.get_lambda(step)
                 loss_out = david_loss(
                     recon=output.recon,
                     target=features,
@@ -443,6 +449,8 @@ def main():
                     logvar=output.logvar,
                     beta=beta,
                     m=output.m,
+                    lambda_entropy=lambda_entropy,
+                    attn_entropy=output.attn_entropy,
                 )
 
             # Backward (scaled for gradient accumulation)
@@ -465,7 +473,9 @@ def main():
                     "loss/total": loss_out.total.item(),
                     "loss/mse": loss_out.mse,
                     "loss/kl": loss_out.kl,
+                    "loss/entropy": loss_out.entropy,
                     "beta": beta,
+                    "lambda_entropy": lambda_entropy,
                     "truncation/m": output.m,
                     "truncation/ratio": m_ratio_hi,
                     "truncation/min_ratio": m_ratio_lo,
@@ -476,12 +486,15 @@ def main():
                 if use_wandb:
                     wandb.log(metrics, step=step)
                 if pbar is not None:
-                    pbar.set_postfix({
+                    postfix = {
                         "mse": f"{loss_out.mse:.4f}",
                         "kl": f"{loss_out.kl:.4f}",
                         "m": output.m,
                         "beta": f"{beta:.2e}",
-                    })
+                    }
+                    if loss_out.entropy > 0.0:
+                        postfix["ent"] = f"{loss_out.entropy:.4f}"
+                    pbar.set_postfix(postfix)
 
                 if args.smoke_test:
                     print(f"\n[Smoke test] Step {step}: {metrics}")
