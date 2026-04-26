@@ -83,14 +83,18 @@ def unpack_batch(batch, device):
 
 
 @torch.no_grad()
-def validate(vae, val_loader, beta, device, max_batches: int = 0):
-    """Run over the validation set (up to max_batches if >0) and return average loss metrics."""
+def validate(vae, val_loader, beta, device, max_batches: int = 0, is_dist: bool = False, show_progress: bool = True):
+    """Run validation (optionally capped by max_batches) and return average metrics.
+
+    In DDP mode, each rank validates its own shard and then aggregates totals with
+    all-reduce so the returned metric is global.
+    """
     from david.loss import david_loss
     vae.eval()
     total_mse, n_batches = 0.0, 0
     device_type = device.split(":")[0] if isinstance(device, str) else device.type
     n_total = max_batches if max_batches > 0 else len(val_loader)
-    pbar = tqdm(val_loader, total=n_total, desc="Validating", leave=False)
+    pbar = tqdm(val_loader, total=n_total, desc="Validating", leave=False, disable=not show_progress)
     for batch in pbar:
         features, mask = unpack_batch(batch, device)
         N = features.shape[1]
@@ -109,6 +113,13 @@ def validate(vae, val_loader, beta, device, max_batches: int = 0):
             break
     pbar.close()
     vae.train()
+
+    if is_dist:
+        stats = torch.tensor([total_mse, float(n_batches)], device=device, dtype=torch.float64)
+        dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+        total_mse = float(stats[0].item())
+        n_batches = int(stats[1].item())
+
     if n_batches == 0:
         return {"val/mse": 0.0}
     return {"val/mse": total_mse / n_batches}
@@ -196,7 +207,7 @@ def main():
 
     # ── Imports (deferred so smoke tests don't require full deps) ──
     from david.vae import DAVIDVAE, DAVIDConfig
-    from david.loss import david_loss, BetaScheduler
+    from david.loss import david_loss, BetaScheduler, MRatioScheduler
     from david.dataset import PerceptionTestVideoDataset
     from david.utils import EMAModel
 
@@ -230,6 +241,23 @@ def main():
         beta_target=cfg.training.beta_target,
         warmup_start=cfg.training.warmup_steps,
         warmup_end=cfg.training.warmup_steps + cfg.training.beta_warmup_steps,
+    )
+    # Sliding m-ratio window: early steps prefer short prefixes, later steps
+    # shift toward longer prefixes.
+    m_ratio_start = cfg.training.get("m_ratio_start", 0.5)  # legacy upper-bound key
+    m_ratio_warmup_start = cfg.training.get("m_ratio_warmup_start", 0)
+    m_ratio_warmup_steps = cfg.training.get("m_ratio_warmup_steps", 0)
+    m_ratio_min_start = cfg.training.get("m_ratio_min_start", 0.0)
+    m_ratio_max_start = cfg.training.get("m_ratio_max_start", m_ratio_start)
+    m_ratio_min_end = cfg.training.get("m_ratio_min_end", 0.6)
+    m_ratio_max_end = cfg.training.get("m_ratio_max_end", 1.1)
+    m_sched = MRatioScheduler(
+        lo_start=m_ratio_min_start,
+        hi_start=m_ratio_max_start,
+        lo_end=m_ratio_min_end,
+        hi_end=m_ratio_max_end,
+        warmup_start=m_ratio_warmup_start,
+        warmup_end=m_ratio_warmup_start + m_ratio_warmup_steps,
     )
 
     # ── Dataset ──
@@ -294,10 +322,20 @@ def main():
         mode = "online" if args.online else "cached"
         try:
             val_dataset = make_dataset(cfg, val_split, mode, backbone)
+            val_sampler = None
+            if world_size > 1:
+                val_sampler = DistributedSampler(
+                    val_dataset,
+                    num_replicas=world_size,
+                    rank=rank,
+                    shuffle=False,
+                    drop_last=False,
+                )
             val_loader = DataLoader(
                 val_dataset,
                 batch_size=cfg.training.batch_size,
-                shuffle=False,
+                shuffle=False if val_sampler is None else False,
+                sampler=val_sampler,
                 collate_fn=PerceptionTestVideoDataset.collate_fn,
                 num_workers=0 if args.online else num_workers,
                 pin_memory=(str(device).startswith("cuda")),
@@ -334,7 +372,14 @@ def main():
     grad_accum = cfg.training.gradient_accumulation_steps
 
     max_val_samples = getattr(cfg.logging, 'max_val_samples', 0)
-    max_val_batches = (max_val_samples + cfg.training.batch_size - 1) // cfg.training.batch_size if max_val_samples > 0 else 0
+    if max_val_samples > 0:
+        per_rank_val_samples = (
+            (max_val_samples + world_size - 1) // world_size
+            if is_dist else max_val_samples
+        )
+        max_val_batches = (per_rank_val_samples + cfg.training.batch_size - 1) // cfg.training.batch_size
+    else:
+        max_val_batches = 0
     best_val_loss = float("inf")
 
     step = start_step
@@ -375,7 +420,8 @@ def main():
 
             # Sample m once on rank 0, broadcast to all ranks for DDP correctness
             N = features.shape[1]
-            m = torch.randint(1, N + 1, (1,)).item()
+            m = m_sched.sample_m(step, N)
+            m_ratio_lo, m_ratio_hi = m_sched.get_ratio_window(step)
             if is_dist:
                 m_t = torch.tensor([m], dtype=torch.long, device=device)
                 dist.broadcast(m_t, src=0)
@@ -421,6 +467,9 @@ def main():
                     "loss/kl": loss_out.kl,
                     "beta": beta,
                     "truncation/m": output.m,
+                    "truncation/ratio": m_ratio_hi,
+                    "truncation/min_ratio": m_ratio_lo,
+                    "truncation/max_ratio": m_ratio_hi,
                     "lr": scheduler.get_last_lr()[0],
                     "ema_decay": ema.decay,
                 }
@@ -437,19 +486,28 @@ def main():
                 if args.smoke_test:
                     print(f"\n[Smoke test] Step {step}: {metrics}")
 
-            # Validation (main process only)
-            if is_main and val_loader is not None and step > 0 and step % cfg.logging.eval_every == 0:
-                val_metrics = validate(vae, val_loader, beta, device, max_batches=max_val_batches)
-                if use_wandb:
-                    wandb.log(val_metrics, step=step)
-                print(f"  [Val] step {step}: mse={val_metrics['val/mse']:.6f}")
-                if val_metrics["val/mse"] < best_val_loss:
-                    best_val_loss = val_metrics["val/mse"]
-                    save_checkpoint(raw_vae, optimizer, ema, step, best_val_loss,
-                                    cfg.logging.checkpoint_dir)
-                    save_checkpoint(raw_vae, optimizer, ema, step, best_val_loss,
-                                    cfg.logging.checkpoint_dir, filename="best.pt")
-                    print(f"  [Best] val_mse={best_val_loss:.6f}")
+            should_validate = val_loader is not None and step > 0 and step % cfg.logging.eval_every == 0
+            if should_validate:
+                val_metrics = validate(
+                    vae,
+                    val_loader,
+                    beta,
+                    device,
+                    max_batches=max_val_batches,
+                    is_dist=is_dist,
+                    show_progress=is_main,
+                )
+                if is_main:
+                    if use_wandb:
+                        wandb.log(val_metrics, step=step)
+                    print(f"  [Val] step {step}: mse={val_metrics['val/mse']:.6f}")
+                    if val_metrics["val/mse"] < best_val_loss:
+                        best_val_loss = val_metrics["val/mse"]
+                        save_checkpoint(raw_vae, optimizer, ema, step, best_val_loss,
+                                        cfg.logging.checkpoint_dir)
+                        save_checkpoint(raw_vae, optimizer, ema, step, best_val_loss,
+                                        cfg.logging.checkpoint_dir, filename="best.pt")
+                        print(f"  [Best] val_mse={best_val_loss:.6f}")
 
             # Checkpointing (main process only)
             if is_main and not args.smoke_test and step > 0 and step % cfg.logging.save_every == 0:

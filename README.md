@@ -88,6 +88,7 @@ python train.py --config configs/train_config_2b_online.yaml --online
 ### 4. Evaluate VQA (Qwen3-VL and DAVID+VAE)
 
 Evaluate multiple-choice VQA accuracy on the PerceptionTest validation set using per-sample questions from a JSON file:
+For the 2B backbone, use the corresponding config:
 
 ```bash
 python train.py --config configs/train_config_2b_online.yaml

@@ -1,7 +1,7 @@
 model:
-  backbone_name: "Qwen/Qwen3-VL-8B-Instruct"
+  backbone_name: "Qwen/Qwen3-VL-2B-Instruct"
   backbone_dtype: "bfloat16"
-  input_dim: 4096         # Qwen3-VL-8B pooler_output dim (= latent dim)
+  input_dim: 2048         # Qwen3-VL-2B pooler_output dim (= latent dim)
   n_encoder_layers: 4
   n_decoder_layers: 4
   n_heads: 16
@@ -18,6 +18,12 @@ training:
   warmup_steps: 1000
   beta_target: 1.0e-4
   beta_warmup_steps: 10000
+  m_ratio_min_start: 0.0    # early window lower bound: m ~ Uniform(floor(0.0N), floor(0.5N))
+  m_ratio_max_start: 0.5
+  m_ratio_min_end: 0.6      # late window lower bound
+  m_ratio_max_end: 1.1      # late window upper bound (values >1 are clamped to N tokens)
+  m_ratio_warmup_start: 0 
+  m_ratio_warmup_steps: 1000 
   grad_clip: 1.0
   ema_decay: 0.999
 

@@ -92,7 +92,19 @@ class EMAModel:
 
     def load_state_dict(self, state: dict) -> None:
         self.decay = state["decay"]
-        self.shadow = state["shadow"]
+        loaded_shadow = state["shadow"]
+
+        # Checkpoints are often loaded on CPU first; align loaded EMA weights
+        # to this instance's expected device/dtype (derived from current shadow).
+        aligned_shadow: dict[str, Tensor] = {}
+        for name, ref_tensor in self.shadow.items():
+            loaded = loaded_shadow.get(name)
+            if loaded is None:
+                aligned_shadow[name] = ref_tensor.clone()
+                continue
+            aligned_shadow[name] = loaded.to(device=ref_tensor.device, dtype=ref_tensor.dtype)
+
+        self.shadow = aligned_shadow
 
 
 def sample_frame_indices_at_fps(

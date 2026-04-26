@@ -1,5 +1,6 @@
 """Loss functions and beta scheduler for DAVID VAE training."""
 
+import math
 import torch
 from torch import Tensor
 from dataclasses import dataclass
@@ -99,3 +100,57 @@ class BetaScheduler:
             return self.beta_target
         progress = (step - self.warmup_start) / (self.warmup_end - self.warmup_start)
         return self.beta_target * progress
+
+
+class MRatioScheduler:
+    """Linear schedule for sliding prefix-ratio sampling window.
+
+    m is sampled from a ratio window [lo_ratio, hi_ratio] over N tokens:
+      m ~ Uniform(floor(N * lo_ratio), floor(N * hi_ratio))
+
+    The window endpoints are linearly scheduled:
+      lo_ratio: lo_start -> lo_end
+      hi_ratio: hi_start -> hi_end
+
+    Ratios are not clipped to 1.0 so values like hi_ratio=1.1 are allowed, and
+    converted token bounds are clamped into [0, N].
+    """
+
+    def __init__(
+        self,
+        lo_start: float,
+        hi_start: float,
+        lo_end: float,
+        hi_end: float,
+        warmup_start: int,
+        warmup_end: int,
+    ):
+        self.lo_start = float(lo_start)
+        self.hi_start = float(hi_start)
+        self.lo_end = float(lo_end)
+        self.hi_end = float(hi_end)
+        self.warmup_start = warmup_start
+        self.warmup_end = warmup_end
+
+    @staticmethod
+    def _lerp(start: float, end: float, progress: float) -> float:
+        return start + progress * (end - start)
+
+    def get_ratio_window(self, step: int) -> tuple[float, float]:
+        if step <= self.warmup_start:
+            lo, hi = self.lo_start, self.hi_start
+        elif step >= self.warmup_end:
+            lo, hi = self.lo_end, self.hi_end
+        else:
+            progress = (step - self.warmup_start) / (self.warmup_end - self.warmup_start)
+            lo = self._lerp(self.lo_start, self.lo_end, progress)
+            hi = self._lerp(self.hi_start, self.hi_end, progress)
+        return (min(lo, hi), max(lo, hi))
+
+    def sample_m(self, step: int, n_tokens: int) -> int:
+        lo_ratio, hi_ratio = self.get_ratio_window(step)
+        lower = max(0, min(n_tokens, math.floor(n_tokens * lo_ratio)))
+        upper = max(0, min(n_tokens, math.floor(n_tokens * hi_ratio)))
+        if upper < lower:
+            lower, upper = upper, lower
+        return torch.randint(lower, upper + 1, (1,)).item()
